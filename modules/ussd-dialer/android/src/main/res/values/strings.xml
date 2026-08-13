@@ -1,0 +1,3 @@
+<resources>
+  <string name="ussd_accessibility_description">Enters only your saved replies in an active USSD menu after you start a route.</string>
+</resources>

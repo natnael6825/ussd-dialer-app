@@ -1,0 +1,13 @@
+apply plugin: 'com.android.library'
+apply plugin: 'expo-module-gradle-plugin'
+
+group = 'com.fikre.ussddialer'
+version = '1.0.0'
+
+android {
+  namespace 'com.fikre.ussddialer'
+  defaultConfig {
+    minSdkVersion 24
+    versionName '1.0.0'
+  }
+}

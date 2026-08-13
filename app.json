@@ -1,0 +1,41 @@
+{
+  "expo": {
+    "name": "USSD Flow",
+    "slug": "ussd-flow",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "platforms": [
+      "android"
+    ],
+    "android": {
+      "package": "com.fikre.ussdflow",
+      "permissions": [
+        "android.permission.CALL_PHONE",
+        "android.permission.READ_PHONE_STATE"
+      ],
+      "adaptiveIcon": {
+        "backgroundColor": "#184F3B",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "minSdkVersion": 24
+          }
+        }
+      ],
+      "expo-font"
+    ]
+  }
+}
