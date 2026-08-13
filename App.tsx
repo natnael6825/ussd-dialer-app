@@ -16,6 +16,7 @@ import {
   AppState,
   Image,
   KeyboardAvoidingView,
+  Linking,
   PermissionsAndroid,
   Platform,
   Pressable,
@@ -30,6 +31,8 @@ import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-
 import UssdDialer from './modules/ussd-dialer';
 
 type RunState = 'idle' | 'dialing' | 'answered' | 'failed';
+type RunMode = 'none' | 'test' | 'automation';
+type BusyAction = 'starting' | 'stopping' | 'recording' | 'saving' | 'deleting' | 'clearing' | 'dismissing' | null;
 type SimOption = {
   id: number;
   slotIndex: number;
@@ -62,6 +65,7 @@ type HistorySession = {
   entries: HistoryEntry[];
 };
 type AppView = 'build' | 'saved' | 'history';
+type PermissionState = 'checking' | 'granted' | 'missing' | 'blocked';
 type RecordingResult = {
   status: string;
   code: string;
@@ -69,6 +73,76 @@ type RecordingResult = {
   replies: string[];
   updatedAt: number;
 };
+type AutomationResult = {
+  status: string;
+  sessionId: string;
+  flowName: string;
+  code: string;
+  subscriptionId: number;
+  currentStep: number;
+  totalSteps: number;
+  updatedAt: number;
+  message: string;
+};
+
+const EMPTY_AUTOMATION: AutomationResult = {
+  status: 'idle',
+  sessionId: '',
+  flowName: '',
+  code: '',
+  subscriptionId: -1,
+  currentStep: 0,
+  totalSteps: 0,
+  updatedAt: 0,
+  message: '',
+};
+
+const ACTIVE_AUTOMATION_STATUSES = new Set(['starting', 'running', 'waiting', 'sending', 'stopping']);
+const CALM_AUTOMATION_STATUSES = new Set(['idle', 'reviewed']);
+
+function errorMessage(caught: unknown, fallback: string) {
+  return caught instanceof Error && caught.message.trim() ? caught.message : fallback;
+}
+
+function automationStatusTitle(status: string) {
+  switch (status) {
+    case 'completed': return 'Flow completed';
+    case 'cancelled': return 'Flow cancelled';
+    case 'timed_out': return 'Carrier timed out';
+    case 'interrupted':
+    case 'interrupted_pending':
+    case 'window_interrupted':
+    case 'response_changed': return 'Flow interrupted safely';
+    case 'stopped': return 'Flow stopped';
+    case 'replaced': return 'Previous flow stopped';
+    case 'needs_attention': return 'Manual action needed';
+    case 'close_failed': return 'Flow completed';
+    case 'failed':
+    case 'failed_to_start':
+    case 'action_failed':
+    case 'send_failed':
+    case 'cancel_failed':
+    case 'cancel_control_not_found':
+    case 'storage_error': return 'Flow could not continue';
+    default: return 'Flow ended';
+  }
+}
+
+function historyStatusLabel(status: string) {
+  if (status === 'timed_out') return 'TIMEOUT';
+  if (['interrupted', 'interrupted_pending', 'window_interrupted', 'response_changed', 'replaced'].includes(status)) return 'INTERRUPTED';
+  if (['needs_attention', 'unexpected_end'].includes(status)) return 'ATTENTION';
+  if (['failed', 'failed_to_start', 'action_failed', 'send_failed', 'cancel_failed', 'cancel_control_not_found', 'close_failed', 'storage_error'].includes(status)) return 'FAILED';
+  return status.replace(/_/g, ' ').toUpperCase();
+}
+
+function historyActionLabel(entry: HistoryEntry) {
+  if (entry.action === 'cancel') return 'CANCELLED AFTER RESPONSE';
+  if (entry.action === 'complete') return 'FINAL RESPONSE';
+  if (entry.action === 'ended') return 'SESSION ENDED';
+  if (entry.action === 'failed') return 'CARRIER FAILURE';
+  return entry.reply ? `REPLIED ${entry.reply}` : 'RESPONSE CAPTURED';
+}
 
 const COLORS = {
   ink: '#111713',
@@ -112,49 +186,130 @@ function UssdFlowApp() {
   const [code, setCode] = useState('*667#');
   const [steps, setSteps] = useState(['1', '3', '1']);
   const [state, setState] = useState<RunState>('idle');
+  const [runMode, setRunMode] = useState<RunMode>('none');
+  const [busyAction, setBusyAction] = useState<BusyAction>(null);
   const [response, setResponse] = useState('');
   const [error, setError] = useState('');
+  const [recoveryError, setRecoveryError] = useState('');
   const [nextIndex, setNextIndex] = useState(0);
   const [simOptions, setSimOptions] = useState<SimOption[]>([]);
   const [selectedSimId, setSelectedSimId] = useState<number | null>(null);
   const [simError, setSimError] = useState('');
   const [loadingSims, setLoadingSims] = useState(true);
+  const [simPermission, setSimPermission] = useState<PermissionState>('checking');
+  const [callPermission, setCallPermission] = useState<PermissionState>('checking');
+  const [permissionsReady, setPermissionsReady] = useState(false);
+  const [permissionRequesting, setPermissionRequesting] = useState<'sim' | 'call' | null>(null);
   const [accessibilityEnabled, setAccessibilityEnabled] = useState(false);
   const [activeView, setActiveView] = useState<AppView>('build');
   const [flowName, setFlowName] = useState('');
   const [savedFlows, setSavedFlows] = useState<SavedFlow[]>([]);
   const [history, setHistory] = useState<HistorySession[]>([]);
+  const [libraryLoaded, setLibraryLoaded] = useState(false);
+  const [libraryError, setLibraryError] = useState('');
   const [expandedSessionId, setExpandedSessionId] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
+  const [recordingStatusKnown, setRecordingStatusKnown] = useState(false);
+  const [recordingSyncError, setRecordingSyncError] = useState('');
+  const [automation, setAutomation] = useState<AutomationResult>(EMPTY_AUTOMATION);
+  const [automationStatusKnown, setAutomationStatusKnown] = useState(false);
   const responseOpacity = useRef(new Animated.Value(0)).current;
   const handledRecordingAt = useRef(0);
+  const operationLock = useRef(false);
+  const directRequestId = useRef(0);
+  const reconcileInFlight = useRef<Promise<void> | null>(null);
 
   const routeSummary = useMemo(
     () => [normalizeCode(code), ...steps.map((step) => step.trim()).filter(Boolean)].join('  →  '),
     [code, steps],
   );
   const valid = selectedSimId !== null && normalizeCode(code).length >= 3 && steps.some((step) => step.trim());
+  const setupReady = permissionsReady
+    && simPermission === 'granted'
+    && callPermission === 'granted'
+    && accessibilityEnabled;
+  const missingPermissionCount = permissionsReady
+    ? Number(simPermission !== 'granted')
+      + Number(callPermission !== 'granted')
+      + Number(!accessibilityEnabled)
+    : 0;
+  const automationActive = ACTIVE_AUTOMATION_STATUSES.has(automation.status);
+  const automationTerminal = automationStatusKnown
+    && !automationActive
+    && !CALM_AUTOMATION_STATUSES.has(automation.status);
+  const operationActive = runMode !== 'none' || automationActive || isRecording || busyAction !== null;
+  const operationsReady = automationStatusKnown && recordingStatusKnown;
+  const recordActionDisabled = busyAction !== null || (!isRecording && (
+    !normalizeCode(code)
+    || selectedSimId === null
+    || !setupReady
+    || !operationsReady
+    || runMode !== 'none'
+    || automationActive
+  ));
 
   useEffect(() => {
-    loadSimOptions();
-    refreshAccessibilityStatus();
-    loadLibrary();
-    syncRecording();
+    reconcileApp();
     const subscription = AppState.addEventListener('change', (nextState) => {
       if (nextState === 'active') {
-        refreshAccessibilityStatus();
-        loadLibrary();
-        syncRecording();
+        reconcileApp();
       }
     });
     return () => subscription.remove();
   }, []);
 
-  async function refreshAccessibilityStatus() {
+  useEffect(() => {
+    if (!automationActive || busyAction === 'starting') return undefined;
+    const timer = setInterval(() => {
+      Promise.all([syncAutomation(), loadLibrary()]).catch(() => undefined);
+    }, 1800);
+    return () => clearInterval(timer);
+  }, [automationActive, busyAction]);
+
+  async function reconcileApp() {
+    if (reconcileInFlight.current) return reconcileInFlight.current;
+    const task = (async () => {
+      await refreshPermissionStatus();
+      await Promise.all([loadLibrary(), syncRecording(), syncAutomation()]);
+    })();
+    reconcileInFlight.current = task;
     try {
-      setAccessibilityEnabled(await UssdDialer.isAccessibilityEnabled());
+      await task;
+    } finally {
+      if (reconcileInFlight.current === task) reconcileInFlight.current = null;
+    }
+  }
+
+  async function refreshPermissionStatus() {
+    if (Platform.OS !== 'android') {
+      setPermissionsReady(true);
+      return;
+    }
+
+    try {
+      const [canReadSim, canCall, canAutomate] = await Promise.all([
+        PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.READ_PHONE_STATE).catch(() => false),
+        PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.CALL_PHONE).catch(() => false),
+        UssdDialer.isAccessibilityEnabled().catch(() => false),
+      ]);
+      setSimPermission((current) => (canReadSim ? 'granted' : current === 'blocked' ? 'blocked' : 'missing'));
+      setCallPermission((current) => (canCall ? 'granted' : current === 'blocked' ? 'blocked' : 'missing'));
+      setAccessibilityEnabled(canAutomate);
+      if (canReadSim) {
+        await loadSimOptions();
+      } else {
+        setLoadingSims(false);
+        setSimOptions([]);
+        setSelectedSimId(null);
+        setSimError('Allow SIM access from the setup banner above.');
+      }
     } catch {
+      setSimPermission((current) => (current === 'blocked' ? 'blocked' : 'missing'));
+      setCallPermission((current) => (current === 'blocked' ? 'blocked' : 'missing'));
       setAccessibilityEnabled(false);
+      setLoadingSims(false);
+    } finally {
+      setPermissionsReady(true);
     }
   }
 
@@ -166,14 +321,35 @@ function UssdFlowApp() {
       ]);
       setSavedFlows(flows);
       setHistory(entries);
-    } catch {
-      // The library remains usable after the native module finishes loading.
+      setLibraryLoaded(true);
+      setLibraryError('');
+    } catch (caught) {
+      setLibraryError(errorMessage(caught, 'Saved flows and session history could not be loaded. Your existing data was not changed.'));
+    }
+  }
+
+  async function syncAutomation() {
+    try {
+      const result = await UssdDialer.getAutomationStatus();
+      setAutomation(result);
+      setAutomationStatusKnown(true);
+      if (ACTIVE_AUTOMATION_STATUSES.has(result.status)) {
+        setRunMode('automation');
+        setState('idle');
+      } else {
+        setRunMode((current) => (current === 'automation' ? 'none' : current));
+      }
+    } catch (caught) {
+      setAutomationStatusKnown(false);
+      setRecoveryError(errorMessage(caught, 'Could not confirm whether a flow is still active. Retry before starting another flow.'));
     }
   }
 
   async function syncRecording() {
     try {
       const recording = await UssdDialer.getRecording();
+      setRecordingStatusKnown(true);
+      setRecordingSyncError('');
       setIsRecording(recording.status === 'recording');
       if (
         recording.status === 'reviewed' &&
@@ -186,14 +362,21 @@ function UssdFlowApp() {
       if (
         recording.status !== 'idle' &&
         recording.status !== 'recording' &&
-        recording.updatedAt > handledRecordingAt.current
+        recording.status !== 'reviewed'
       ) {
-        handledRecordingAt.current = recording.updatedAt;
-        applyRecording(recording);
-        await UssdDialer.acknowledgeRecording(recording.updatedAt);
+        if (recording.updatedAt > handledRecordingAt.current) {
+          handledRecordingAt.current = recording.updatedAt;
+          applyRecording(recording);
+        }
+        try {
+          await UssdDialer.acknowledgeRecording(recording.updatedAt);
+        } catch (caught) {
+          setRecoveryError(errorMessage(caught, 'The recording was recovered, but its review state could not be saved.'));
+        }
       }
-    } catch {
-      setIsRecording(false);
+    } catch (caught) {
+      setRecordingStatusKnown(false);
+      setRecordingSyncError(errorMessage(caught, 'Could not confirm whether recording is still active.'));
     }
   }
 
@@ -203,12 +386,18 @@ function UssdFlowApp() {
     if (recording.replies.length) setSteps(recording.replies);
     if (!showNotice) return;
     const count = recording.replies.length;
-    Alert.alert(
-      count ? 'Flow recorded' : 'Nothing recorded',
-      count
-        ? `${count} ${count === 1 ? 'reply was' : 'replies were'} captured. Review the steps, enter a flow name, then save it.`
-        : 'No menu replies were captured. Try recording again and press Send after each reply.',
-    );
+    const partial = ['cancelled', 'timed_out', 'interrupted', 'failed', 'stopped'].includes(recording.status);
+    const title = recording.status === 'timed_out'
+      ? 'Recording timed out'
+      : recording.status === 'interrupted'
+        ? 'Recording interrupted'
+        : recording.status === 'failed'
+          ? 'Recording stopped by an error'
+          : count ? (partial ? 'Partial flow recovered' : 'Flow recorded') : 'Nothing recorded';
+    const detail = count
+      ? `${count} confirmed ${count === 1 ? 'reply was' : 'replies were'} preserved. Review the steps, name the flow, then save it.`
+      : 'No confirmed menu replies were captured. Your existing draft was kept; you can try recording again.';
+    Alert.alert(title, detail);
   }
 
   async function loadSimOptions() {
@@ -216,19 +405,13 @@ function UssdFlowApp() {
     setLoadingSims(true);
     setSimError('');
     try {
-      const permission = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.READ_PHONE_STATE, {
-        title: 'Choose a SIM',
-        message: 'USSD Flow needs phone access to show the active SIM cards before dialing.',
-        buttonPositive: 'Show SIMs',
-        buttonNegative: 'Not now',
-      });
-      if (permission !== PermissionsAndroid.RESULTS.GRANTED) {
-        setSimError('Allow phone access to choose a SIM.');
-        return;
-      }
       const subscriptions = await UssdDialer.getSubscriptions();
       setSimOptions(subscriptions);
-      setSelectedSimId(subscriptions.length === 1 ? subscriptions[0].id : null);
+      setSelectedSimId((current) => (
+        subscriptions.some((subscription) => subscription.id === current)
+          ? current
+          : subscriptions.length === 1 ? subscriptions[0].id : null
+      ));
       if (!subscriptions.length) setSimError('No active SIM card was found.');
     } catch (caught) {
       setSimError(caught instanceof Error ? caught.message : 'Could not read the active SIM cards.');
@@ -255,13 +438,91 @@ function UssdFlowApp() {
 
   async function ensurePhonePermission() {
     if (Platform.OS !== 'android') return false;
-    const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.CALL_PHONE, {
-      title: 'Allow USSD requests',
-      message: 'USSD Flow needs phone access to send the code and receive the carrier response.',
-      buttonPositive: 'Allow',
-      buttonNegative: 'Not now',
-    });
-    return result === PermissionsAndroid.RESULTS.GRANTED;
+    try {
+      const [canReadSim, canCall] = await Promise.all([
+        PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.READ_PHONE_STATE),
+        PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.CALL_PHONE),
+      ]);
+      setSimPermission((current) => (canReadSim ? 'granted' : current === 'blocked' ? 'blocked' : 'missing'));
+      setCallPermission((current) => (canCall ? 'granted' : current === 'blocked' ? 'blocked' : 'missing'));
+      setPermissionsReady(true);
+      if (!canReadSim || !canCall) {
+        Alert.alert('Finish setup', 'Use the permission banner at the top of the app to allow SIM access and USSD calling.');
+        return false;
+      }
+      return true;
+    } catch (caught) {
+      setRecoveryError(errorMessage(caught, 'Android could not confirm the phone permissions. Retry before dialing.'));
+      return false;
+    }
+  }
+
+  async function requestSimPermission() {
+    if (permissionRequesting) return;
+    setPermissionRequesting('sim');
+    try {
+      const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.READ_PHONE_STATE, {
+        title: 'Allow SIM access',
+        message: 'USSD Flow uses this access to show your active SIM cards and dial with the one you choose.',
+        buttonPositive: 'Allow',
+        buttonNegative: 'Not now',
+      });
+      if (result === PermissionsAndroid.RESULTS.GRANTED) {
+        setSimPermission('granted');
+        await loadSimOptions();
+        return;
+      }
+      setSimPermission(result === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN ? 'blocked' : 'missing');
+      setLoadingSims(false);
+    } catch {
+      Alert.alert('Permission unavailable', 'Android could not open the SIM permission request. Try App settings instead.');
+    } finally {
+      setPermissionRequesting(null);
+    }
+  }
+
+  async function requestCallPermission() {
+    if (permissionRequesting) return;
+    setPermissionRequesting('call');
+    try {
+      const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.CALL_PHONE, {
+        title: 'Allow USSD calling',
+        message: 'USSD Flow needs calling access to start the USSD request you choose.',
+        buttonPositive: 'Allow',
+        buttonNegative: 'Not now',
+      });
+      setCallPermission(
+        result === PermissionsAndroid.RESULTS.GRANTED
+          ? 'granted'
+          : result === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN ? 'blocked' : 'missing',
+      );
+    } catch {
+      Alert.alert('Permission unavailable', 'Android could not open the calling permission request. Try App settings instead.');
+    } finally {
+      setPermissionRequesting(null);
+    }
+  }
+
+  async function openAppPermissionSettings() {
+    try {
+      await Linking.openSettings();
+    } catch {
+      Alert.alert('Settings unavailable', 'Open Android Settings, choose Apps, then USSD Flow to enable access.');
+    }
+  }
+
+  function beginExclusiveOperation() {
+    if (operationLock.current || operationActive) {
+      Alert.alert('Another action is active', 'Stop or finish the current flow before starting a new one.');
+      return false;
+    }
+    operationLock.current = true;
+    return true;
+  }
+
+  function endExclusiveOperation() {
+    operationLock.current = false;
+    setBusyAction(null);
   }
 
   async function dial(request: string, guided: boolean) {
@@ -276,9 +537,21 @@ function UssdFlowApp() {
       Alert.alert('Choose a SIM', 'Select the SIM card to use before dialing.');
       return;
     }
+    if (!operationsReady) {
+      Alert.alert('Checking active sessions', 'Wait a moment while USSD Flow confirms that no recording or automation is still active.');
+      return;
+    }
+    if (!beginExclusiveOperation()) return;
+    setBusyAction('starting');
+    const requestId = ++directRequestId.current;
     const allowed = await ensurePhonePermission();
-    if (!allowed) return;
+    if (!allowed) {
+      endExclusiveOperation();
+      return;
+    }
 
+    setBusyAction(null);
+    setRunMode('test');
     setState('dialing');
     setResponse('');
     setError('');
@@ -287,6 +560,7 @@ function UssdFlowApp() {
 
     try {
       const carrierResponse = await UssdDialer.send(normalizeCode(request), selectedSimId);
+      if (requestId !== directRequestId.current) return;
       setResponse(carrierResponse);
       setState('answered');
       Animated.timing(responseOpacity, {
@@ -295,7 +569,8 @@ function UssdFlowApp() {
         useNativeDriver: true,
       }).start();
     } catch (caught) {
-      const message = caught instanceof Error ? caught.message : 'The carrier did not return a response.';
+      if (requestId !== directRequestId.current) return;
+      const message = errorMessage(caught, 'The carrier did not return a response. Check your signal and try again.');
       setError(message);
       setState('failed');
       Animated.timing(responseOpacity, {
@@ -303,6 +578,11 @@ function UssdFlowApp() {
         duration: 240,
         useNativeDriver: true,
       }).start();
+    } finally {
+      if (requestId === directRequestId.current) {
+        setRunMode('none');
+        endExclusiveOperation();
+      }
     }
   }
 
@@ -316,7 +596,11 @@ function UssdFlowApp() {
   }
 
   async function openAccessibilitySetup() {
-    await UssdDialer.openAccessibilitySettings();
+    try {
+      await UssdDialer.openAccessibilitySettings();
+    } catch {
+      Alert.alert('Settings unavailable', 'Open Android Settings, choose Accessibility, then enable USSD Flow automation.');
+    }
   }
 
   async function startStepByStep(flow?: Pick<SavedFlow, 'name' | 'code' | 'replies' | 'subscriptionId'>) {
@@ -324,6 +608,10 @@ function UssdFlowApp() {
     const runSteps = flow?.replies ?? steps;
     const runSimId = flow?.subscriptionId ?? selectedSimId;
     const runName = flow?.name ?? (flowName.trim() || 'Unsaved flow');
+    if (!permissionsReady || !setupReady) {
+      Alert.alert('Finish setup', 'Allow the missing access from the setup banner before running a flow.');
+      return;
+    }
     if (runSimId === null) {
       Alert.alert('Choose a SIM', 'Select the SIM card to use before starting.');
       return;
@@ -334,58 +622,112 @@ function UssdFlowApp() {
     }
     const cleanSteps = runSteps.map((step) => step.trim()).filter(Boolean);
     if (!accessibilityEnabled) {
-      Alert.alert(
-        'Enable automation',
-        'Open Accessibility settings, choose USSD Flow automation, and turn it on. The service acts only after you start a route.',
-        [
-          { text: 'Not now', style: 'cancel' },
-          { text: 'Open settings', onPress: openAccessibilitySetup },
-        ],
-      );
+      Alert.alert('Automation access needed', 'Enable Step automation from the setup banner at the top of the app.');
       return;
     }
-    if (!(await ensurePhonePermission())) return;
+    if (!operationsReady) {
+      Alert.alert('Checking active sessions', 'Wait a moment, then try again.');
+      return;
+    }
+    if (!cleanSteps.length) {
+      Alert.alert('Flow incomplete', 'Add at least one reply or a CANCEL step before playing this flow.');
+      return;
+    }
+    if (!beginExclusiveOperation()) return;
+    setBusyAction('starting');
+    setRunMode('automation');
+    if (!(await ensurePhonePermission())) {
+      setRunMode('none');
+      endExclusiveOperation();
+      return;
+    }
     try {
-      setState('dialing');
+      setAutomation({
+        ...EMPTY_AUTOMATION,
+        status: 'starting',
+        flowName: runName,
+        code: normalizeCode(runCode),
+        subscriptionId: runSimId,
+        totalSteps: cleanSteps.length,
+        updatedAt: Date.now(),
+        message: 'Opening the carrier USSD session…',
+      });
+      setState('idle');
       setResponse('');
       setError('');
       await UssdDialer.startAutomation(normalizeCode(runCode), cleanSteps, runSimId, runName);
+      await syncAutomation();
+      await loadLibrary();
     } catch (caught) {
-      setState('failed');
-      setError(caught instanceof Error ? caught.message : 'Could not start step-by-step dialing.');
-      responseOpacity.setValue(1);
+      setRunMode('none');
+      const message = errorMessage(caught, 'Could not start step-by-step dialing. Nothing was sent.');
+      setAutomation((current) => ({ ...current, status: 'failed_to_start', updatedAt: Date.now(), message }));
+      setRecoveryError(message);
+      setError(message);
+      await syncAutomation();
+    } finally {
+      endExclusiveOperation();
     }
   }
 
   async function startFlowRecording() {
+    if (!permissionsReady || !setupReady) {
+      Alert.alert('Finish setup', 'Allow the missing access from the setup banner before recording.');
+      return;
+    }
     if (selectedSimId === null) {
       Alert.alert('Choose a SIM', 'Select the SIM card to use before recording.');
       return;
     }
     if (!accessibilityEnabled) {
-      Alert.alert('Enable automation', 'Accessibility must be enabled to record the replies you enter.', [
-        { text: 'Not now', style: 'cancel' },
-        { text: 'Open settings', onPress: openAccessibilitySetup },
-      ]);
+      Alert.alert('Automation access needed', 'Enable Step automation from the setup banner before recording.');
       return;
     }
-    if (!(await ensurePhonePermission())) return;
+    if (!operationsReady) {
+      Alert.alert('Checking active sessions', 'Wait a moment, then try again.');
+      return;
+    }
+    if (!beginExclusiveOperation()) return;
+    setBusyAction('recording');
+    if (!(await ensurePhonePermission())) {
+      endExclusiveOperation();
+      return;
+    }
     try {
-      handledRecordingAt.current = Date.now();
-      setIsRecording(true);
       await UssdDialer.startRecording(normalizeCode(code), selectedSimId);
+      setIsRecording(true);
+      setRecordingStatusKnown(true);
+      setRecordingSyncError('');
     } catch (caught) {
       setIsRecording(false);
-      Alert.alert('Recording failed', caught instanceof Error ? caught.message : 'Could not start the USSD recorder.');
+      Alert.alert('Recording failed', errorMessage(caught, 'Could not start the USSD recorder. Nothing was changed.'));
+      await syncRecording();
+    } finally {
+      endExclusiveOperation();
     }
   }
 
   async function stopFlowRecording() {
-    const recording = await UssdDialer.finishRecording();
-    setIsRecording(false);
-    handledRecordingAt.current = recording.updatedAt;
-    applyRecording(recording);
-    await UssdDialer.acknowledgeRecording(recording.updatedAt);
+    if (operationLock.current || busyAction !== null) return;
+    operationLock.current = true;
+    setBusyAction('recording');
+    try {
+      const recording = await UssdDialer.finishRecording();
+      setIsRecording(false);
+      setRecordingStatusKnown(true);
+      handledRecordingAt.current = recording.updatedAt;
+      applyRecording(recording);
+      try {
+        await UssdDialer.acknowledgeRecording(recording.updatedAt);
+      } catch (caught) {
+        setRecoveryError(errorMessage(caught, 'The replies were recovered, but the review state could not be saved.'));
+      }
+    } catch (caught) {
+      setRecoveryError(errorMessage(caught, 'Could not stop recording safely. USSD Flow will check its state again.'));
+      await syncRecording();
+    } finally {
+      endExclusiveOperation();
+    }
   }
 
   async function saveCurrentFlow() {
@@ -397,10 +739,18 @@ function UssdFlowApp() {
       Alert.alert('Flow incomplete', 'Choose a SIM and add the starting code and replies first.');
       return;
     }
-    await UssdDialer.saveFlow(flowName.trim(), normalizeCode(code), steps, selectedSimId);
-    await UssdDialer.clearPendingRecording();
-    await loadLibrary();
-    setActiveView('saved');
+    if (!beginExclusiveOperation()) return;
+    setBusyAction('saving');
+    try {
+      await UssdDialer.saveFlow(flowName.trim(), normalizeCode(code), steps, selectedSimId);
+      await UssdDialer.clearPendingRecording();
+      await loadLibrary();
+      setActiveView('saved');
+    } catch (caught) {
+      setRecoveryError(errorMessage(caught, 'The flow could not be saved. Your draft is still here—try again.'));
+    } finally {
+      endExclusiveOperation();
+    }
   }
 
   function editSavedFlow(flow: SavedFlow) {
@@ -418,8 +768,17 @@ function UssdFlowApp() {
         text: 'Delete',
         style: 'destructive',
         onPress: async () => {
-          await UssdDialer.deleteFlow(flow.id);
-          await loadLibrary();
+          if (operationLock.current || operationActive) return;
+          operationLock.current = true;
+          setBusyAction('deleting');
+          try {
+            await UssdDialer.deleteFlow(flow.id);
+            await loadLibrary();
+          } catch (caught) {
+            setRecoveryError(errorMessage(caught, 'The saved flow could not be deleted. It remains on this phone.'));
+          } finally {
+            endExclusiveOperation();
+          }
         },
       },
     ]);
@@ -432,19 +791,58 @@ function UssdFlowApp() {
         text: 'Clear',
         style: 'destructive',
         onPress: async () => {
-          await UssdDialer.clearResponseHistory();
-          setHistory([]);
+          if (operationLock.current || operationActive) return;
+          operationLock.current = true;
+          setBusyAction('clearing');
+          try {
+            await UssdDialer.clearResponseHistory();
+            setHistory([]);
+          } catch (caught) {
+            setRecoveryError(errorMessage(caught, 'Session history could not be cleared. No history was intentionally removed.'));
+            await loadLibrary();
+          } finally {
+            endExclusiveOperation();
+          }
         },
       },
     ]);
   }
 
   async function cancelStepByStep() {
-    await UssdDialer.cancelAutomation();
-    setState('idle');
+    if (operationLock.current || busyAction !== null) return;
+    operationLock.current = true;
+    setBusyAction('stopping');
+    try {
+      await UssdDialer.cancelAutomation();
+    } catch (caught) {
+      setRecoveryError(errorMessage(caught, 'Could not confirm the stop request. Check the carrier dialog and try Stop again.'));
+    } finally {
+      await syncAutomation();
+      await loadLibrary();
+      endExclusiveOperation();
+    }
+  }
+
+  async function dismissAutomationResult() {
+    if (operationLock.current || automationActive) return;
+    operationLock.current = true;
+    setBusyAction('dismissing');
+    try {
+      await UssdDialer.acknowledgeAutomation(automation.updatedAt);
+      setAutomation(EMPTY_AUTOMATION);
+      setRunMode('none');
+    } catch (caught) {
+      setRecoveryError(errorMessage(caught, 'The result could not be dismissed. It is safe to leave it and try again later.'));
+    } finally {
+      endExclusiveOperation();
+    }
   }
 
   const nextReply = steps[nextIndex]?.trim();
+  const visibleRecoveryError = recoveryError || recordingSyncError || libraryError;
+  const automationProgress = automation.totalSteps > 0
+    ? `${Math.min(automation.currentStep, automation.totalSteps)} of ${automation.totalSteps} replies sent`
+    : 'Waiting for the carrier';
 
   if (!fontsLoaded) {
     return (
@@ -474,11 +872,138 @@ function UssdFlowApp() {
                   <Text style={styles.brandTagline}>Personal dial assistant</Text>
                 </View>
               </View>
-              <Pressable onPress={openAccessibilitySetup} style={({ pressed }) => [styles.settingsButton, pressed && styles.pressed]}>
-                <View style={[styles.statusDot, accessibilityEnabled && styles.statusDotReady]} />
+              <Pressable accessibilityLabel="Open automation settings" onPress={openAccessibilitySetup} style={({ pressed }) => [styles.settingsButton, pressed && styles.pressed]}>
+                <View style={[styles.statusDot, setupReady && styles.statusDotReady]} />
                 <Ionicons name="settings-outline" size={20} color={COLORS.ink} />
               </Pressable>
             </View>
+
+            {permissionsReady && missingPermissionCount > 0 && (
+              <View style={styles.permissionBanner}>
+                <View style={styles.permissionBannerHeader}>
+                  <View style={styles.permissionBannerIcon}>
+                    <Ionicons name="shield-outline" size={21} color={COLORS.red} />
+                  </View>
+                  <View style={styles.permissionBannerHeading}>
+                    <Text accessibilityLiveRegion="polite" accessibilityRole="header" style={styles.permissionBannerTitle}>Finish setup</Text>
+                    <Text style={styles.permissionBannerCopy}>Allow the missing access below before running a flow.</Text>
+                  </View>
+                  <View style={styles.permissionCountPill}>
+                    <Text style={styles.permissionCountText}>{missingPermissionCount} LEFT</Text>
+                  </View>
+                </View>
+
+                {simPermission !== 'granted' && (
+                  <View style={styles.permissionRow}>
+                    <View style={styles.permissionRowIcon}><Ionicons name="card-outline" size={17} color={COLORS.green} /></View>
+                    <View style={styles.permissionRowCopy}>
+                      <Text style={styles.permissionRowTitle}>SIM access</Text>
+                      <Text style={styles.permissionRowDescription}>Choose which active SIM should dial.</Text>
+                    </View>
+                    <Pressable
+                      accessibilityLabel={simPermission === 'blocked' ? 'Open app settings for SIM access' : 'Allow SIM access'}
+                      accessibilityRole="button"
+                      disabled={permissionRequesting !== null}
+                      onPress={simPermission === 'blocked' ? openAppPermissionSettings : requestSimPermission}
+                      style={({ pressed }) => [styles.permissionAction, permissionRequesting !== null && styles.permissionActionBusy, pressed && styles.primaryPressed]}
+                    >
+                      {permissionRequesting === 'sim'
+                        ? <ActivityIndicator color={COLORS.white} size="small" />
+                        : <Text style={styles.permissionActionText}>{simPermission === 'blocked' ? 'Settings' : 'Allow'}</Text>}
+                    </Pressable>
+                  </View>
+                )}
+
+                {callPermission !== 'granted' && (
+                  <View style={styles.permissionRow}>
+                    <View style={styles.permissionRowIcon}><Ionicons name="call-outline" size={17} color={COLORS.green} /></View>
+                    <View style={styles.permissionRowCopy}>
+                      <Text style={styles.permissionRowTitle}>USSD calling</Text>
+                      <Text style={styles.permissionRowDescription}>Start only the USSD request you choose.</Text>
+                    </View>
+                    <Pressable
+                      accessibilityLabel={callPermission === 'blocked' ? 'Open app settings for USSD calling' : 'Allow USSD calling'}
+                      accessibilityRole="button"
+                      disabled={permissionRequesting !== null}
+                      onPress={callPermission === 'blocked' ? openAppPermissionSettings : requestCallPermission}
+                      style={({ pressed }) => [styles.permissionAction, permissionRequesting !== null && styles.permissionActionBusy, pressed && styles.primaryPressed]}
+                    >
+                      {permissionRequesting === 'call'
+                        ? <ActivityIndicator color={COLORS.white} size="small" />
+                        : <Text style={styles.permissionActionText}>{callPermission === 'blocked' ? 'Settings' : 'Allow'}</Text>}
+                    </Pressable>
+                  </View>
+                )}
+
+                {!accessibilityEnabled && (
+                  <View style={styles.permissionRow}>
+                    <View style={styles.permissionRowIcon}><Ionicons name="git-branch-outline" size={17} color={COLORS.green} /></View>
+                    <View style={styles.permissionRowCopy}>
+                      <Text style={styles.permissionRowTitle}>Step automation</Text>
+                      <Text style={styles.permissionRowDescription}>Wait for each response, then send the next reply.</Text>
+                    </View>
+                    <Pressable
+                      accessibilityLabel="Enable step automation"
+                      accessibilityRole="button"
+                      onPress={openAccessibilitySetup}
+                      style={({ pressed }) => [styles.permissionAction, pressed && styles.primaryPressed]}
+                    >
+                      <Text style={styles.permissionActionText}>Enable</Text>
+                    </Pressable>
+                  </View>
+                )}
+              </View>
+            )}
+
+            {automationActive && (
+              <View accessibilityLiveRegion="polite" style={styles.operationBanner}>
+                <View style={styles.operationPulse}><ActivityIndicator color={COLORS.green} size="small" /></View>
+                <View style={styles.operationCopy}>
+                  <Text style={styles.operationEyebrow}>ACTIVE FLOW</Text>
+                  <Text numberOfLines={1} style={styles.operationTitle}>{automation.flowName || 'USSD flow'}</Text>
+                  <Text style={styles.operationDescription}>{automation.message || automationProgress}</Text>
+                  <Text style={styles.operationProgress}>{automationProgress}</Text>
+                </View>
+                <Pressable
+                  accessibilityLabel="Stop active USSD flow"
+                  disabled={busyAction === 'stopping'}
+                  onPress={cancelStepByStep}
+                  style={({ pressed }) => [styles.operationStop, pressed && styles.pressed]}
+                >
+                  {busyAction === 'stopping'
+                    ? <ActivityIndicator color={COLORS.red} size="small" />
+                    : <><Ionicons name="stop" size={14} color={COLORS.red} /><Text style={styles.operationStopText}>Stop</Text></>}
+                </Pressable>
+              </View>
+            )}
+
+            {automationTerminal && (
+              <View accessibilityLiveRegion="polite" style={[styles.operationBanner, styles.operationBannerTerminal]}>
+                <View style={[styles.operationPulse, styles.operationTerminalIcon]}>
+                  <Ionicons name={automation.status === 'completed' ? 'checkmark' : 'alert'} size={17} color={automation.status === 'completed' ? COLORS.green : COLORS.red} />
+                </View>
+                <View style={styles.operationCopy}>
+                  <Text style={styles.operationEyebrow}>LAST SESSION</Text>
+                  <Text style={styles.operationTitle}>{automationStatusTitle(automation.status)}</Text>
+                  <Text style={styles.operationDescription}>{automation.message || `${automationProgress}. Confirm the carrier dialog is closed before retrying.`}</Text>
+                </View>
+                <Pressable disabled={busyAction === 'dismissing'} onPress={dismissAutomationResult} style={styles.operationDismiss}>
+                  {busyAction === 'dismissing' ? <ActivityIndicator color={COLORS.green} size="small" /> : <Ionicons name="close" size={19} color={COLORS.green} />}
+                </Pressable>
+              </View>
+            )}
+
+            {!!visibleRecoveryError && (
+              <View style={styles.recoveryBanner}>
+                <View style={styles.recoveryIcon}><Ionicons name="warning-outline" size={18} color={COLORS.red} /></View>
+                <View style={styles.recoveryCopy}><Text style={styles.recoveryTitle}>Action needs attention</Text><Text style={styles.recoveryText}>{visibleRecoveryError}</Text></View>
+                <Pressable
+                  accessibilityLabel="Retry app status check"
+                  onPress={() => { setRecoveryError(''); setRecordingSyncError(''); setLibraryError(''); reconcileApp(); }}
+                  style={styles.recoveryAction}
+                ><Text style={styles.recoveryActionText}>Retry</Text></Pressable>
+              </View>
+            )}
 
             {activeView === 'build' && (
               <View>
@@ -495,8 +1020,8 @@ function UssdFlowApp() {
                   <View style={styles.setupTopline}>
                     <Text style={styles.setupLabel}>STARTING CODE</Text>
                     <View style={styles.readyPill}>
-                      <View style={[styles.readyDot, !accessibilityEnabled && styles.readyDotOff]} />
-                      <Text style={styles.readyText}>{accessibilityEnabled ? 'READY' : 'SETUP NEEDED'}</Text>
+                      <View style={[styles.readyDot, !setupReady && styles.readyDotOff]} />
+                      <Text style={styles.readyText}>{permissionsReady ? (setupReady ? 'READY' : 'SETUP NEEDED') : 'CHECKING'}</Text>
                     </View>
                   </View>
                   <TextInput
@@ -545,9 +1070,12 @@ function UssdFlowApp() {
                       })}
                     </View>
                   ) : (
-                    <Pressable onPress={loadSimOptions} style={styles.simErrorBox}>
+                    <Pressable
+                      onPress={simPermission === 'granted' ? loadSimOptions : simPermission === 'blocked' ? openAppPermissionSettings : requestSimPermission}
+                      style={styles.simErrorBox}
+                    >
                       <Text style={styles.simErrorText}>{simError || 'No active SIM card found.'}</Text>
-                      <Text style={styles.retryText}>Try again</Text>
+                      <Text style={styles.retryText}>{simPermission === 'granted' ? 'Try again' : simPermission === 'blocked' ? 'Open settings' : 'Allow SIM access'}</Text>
                     </Pressable>
                   )}
                 </View>
@@ -624,47 +1152,44 @@ function UssdFlowApp() {
                       style={styles.flowNameInput}
                       value={flowName}
                     />
-                    <Pressable onPress={saveCurrentFlow} style={({ pressed }) => [styles.saveButton, pressed && styles.pressed]}>
-                      <Ionicons name="bookmark-outline" size={17} color={COLORS.white} />
-                      <Text style={styles.saveButtonText}>Save</Text>
+                    <Pressable disabled={operationActive} onPress={saveCurrentFlow} style={({ pressed }) => [styles.saveButton, operationActive && styles.disabled, pressed && styles.pressed]}>
+                      {busyAction === 'saving' ? <ActivityIndicator color={COLORS.white} size="small" /> : <Ionicons name="bookmark-outline" size={17} color={COLORS.white} />}
+                      <Text style={styles.saveButtonText}>{busyAction === 'saving' ? 'Saving' : 'Save'}</Text>
                     </Pressable>
                   </View>
                 </View>
 
                 <View style={styles.actionGrid}>
                   <Pressable
-                    disabled={!normalizeCode(code) || selectedSimId === null}
+                    disabled={recordActionDisabled}
                     onPress={isRecording ? stopFlowRecording : startFlowRecording}
-                    style={({ pressed }) => [styles.recordAction, isRecording && styles.recordActionActive, (!normalizeCode(code) || selectedSimId === null) && styles.disabled, pressed && styles.primaryPressed]}
+                    style={({ pressed }) => [styles.recordAction, isRecording && styles.recordActionActive, recordActionDisabled && styles.disabled, pressed && styles.primaryPressed]}
                   >
                     <View style={styles.actionIconCircle}><Ionicons name={isRecording ? 'stop' : 'radio'} size={20} color={COLORS.orange} /></View>
                     <Text style={styles.recordActionTitle}>{isRecording ? 'Stop recording' : 'Record manually'}</Text>
                     <Text style={styles.recordActionCopy}>{isRecording ? 'Return here after the USSD session.' : 'Capture the replies you enter.'}</Text>
                   </Pressable>
                   <Pressable
-                    disabled={!valid || !accessibilityEnabled || state === 'dialing' || isRecording}
+                    disabled={!valid || !setupReady || !operationsReady || operationActive}
                     onPress={() => startStepByStep()}
-                    style={({ pressed }) => [styles.playAction, (!valid || !accessibilityEnabled || state === 'dialing' || isRecording) && styles.disabled, pressed && styles.primaryPressed]}
+                    style={({ pressed }) => [styles.playAction, (!valid || !setupReady || !operationsReady || operationActive) && styles.disabled, pressed && styles.primaryPressed]}
                   >
-                    <View style={styles.playIconCircle}><Ionicons name="play" size={19} color={COLORS.green} /></View>
-                    <Text style={styles.playActionTitle}>{state === 'dialing' ? 'Flow running' : 'Play this flow'}</Text>
+                    <View style={styles.playIconCircle}>{busyAction === 'starting' ? <ActivityIndicator color={COLORS.green} size="small" /> : <Ionicons name="play" size={19} color={COLORS.green} />}</View>
+                    <Text style={styles.playActionTitle}>{busyAction === 'starting' ? 'Starting safely' : 'Play this flow'}</Text>
                     <Text style={styles.playActionCopy}>Dial and reply automatically.</Text>
                   </Pressable>
                 </View>
 
-                {state === 'dialing' && (
-                  <Pressable onPress={cancelStepByStep} style={({ pressed }) => [styles.stopButton, pressed && styles.pressed]}>
-                    <Ionicons name="stop-circle-outline" size={18} color={COLORS.red} />
-                    <Text style={styles.stopButtonText}>Stop active automation</Text>
-                  </Pressable>
+                {!!recordingSyncError && (
+                  <View style={styles.inlineStatus}><Ionicons name="warning-outline" size={16} color={COLORS.red} /><Text style={styles.inlineStatusText}>Recording status is uncertain. Tap Retry above before starting anything new.</Text></View>
                 )}
 
                 <View style={styles.utilityRow}>
-                  <Pressable disabled={!valid || state === 'dialing' || Number(Platform.Version) < 26} onPress={() => dial(code, true)} style={({ pressed }) => [styles.utilityButton, (Number(Platform.Version) < 26 || !valid) && styles.utilityDisabled, pressed && styles.pressed]}>
+                  <Pressable disabled={!valid || !operationsReady || operationActive || Number(Platform.Version) < 26} onPress={() => dial(code, true)} style={({ pressed }) => [styles.utilityButton, (Number(Platform.Version) < 26 || !valid || !operationsReady || operationActive) && styles.utilityDisabled, pressed && styles.pressed]}>
                     <Ionicons name="chatbubble-ellipses-outline" size={17} color={COLORS.green} />
                     <Text style={styles.utilityText}>{Number(Platform.Version) < 26 ? 'Test needs Android 8' : 'Test starting code'}</Text>
                   </Pressable>
-                  <Pressable disabled={!normalizeCode(code)} onPress={openPhoneDialer} style={({ pressed }) => [styles.utilityButton, pressed && styles.pressed]}>
+                  <Pressable disabled={!normalizeCode(code) || operationActive} onPress={openPhoneDialer} style={({ pressed }) => [styles.utilityButton, operationActive && styles.utilityDisabled, pressed && styles.pressed]}>
                     <Ionicons name="keypad-outline" size={17} color={COLORS.green} />
                     <Text style={styles.utilityText}>Open dialer</Text>
                   </Pressable>
@@ -699,7 +1224,9 @@ function UssdFlowApp() {
                   <View style={styles.pageHeadingCopy}><Text style={styles.kicker}>YOUR LIBRARY</Text><Text style={styles.pageTitle}>Saved flows.</Text><Text style={styles.pageSubtitle}>Run a familiar USSD route without remembering each menu.</Text></View>
                   <View style={styles.stepBadge}><Text style={styles.stepBadgeText}>{savedFlows.length}</Text></View>
                 </View>
-                {!savedFlows.length ? (
+                {!libraryLoaded && libraryError ? (
+                  <View style={styles.emptyState}><View style={styles.emptyIcon}><Ionicons name="cloud-offline-outline" size={25} color={COLORS.red} /></View><Text style={styles.emptyTitle}>Could not load saved flows</Text><Text style={styles.emptyCopy}>Your data was not cleared. Tap Retry above to check again.</Text></View>
+                ) : !savedFlows.length ? (
                   <View style={styles.emptyState}>
                     <View style={styles.emptyIcon}><Ionicons name="bookmark-outline" size={25} color={COLORS.green} /></View>
                     <Text style={styles.emptyTitle}>No saved flows yet</Text>
@@ -713,12 +1240,12 @@ function UssdFlowApp() {
                       <View style={styles.savedTopline}>
                         <View style={styles.savedIndex}><Text style={styles.savedIndexText}>{String(index + 1).padStart(2, '0')}</Text></View>
                         <View style={styles.savedHeading}><Text style={styles.savedName}>{flow.name}</Text><Text style={styles.savedMeta}>{sim ? `SIM ${sim.slotIndex + 1}  ·  ${sim.carrierName}` : 'Saved SIM unavailable'}</Text></View>
-                        <Pressable onPress={() => deleteSavedFlow(flow)} hitSlop={8} style={styles.iconButton}><Ionicons name="trash-outline" size={18} color={COLORS.red} /></Pressable>
+                        <Pressable disabled={operationActive} onPress={() => deleteSavedFlow(flow)} hitSlop={8} style={[styles.iconButton, operationActive && styles.disabled]}><Ionicons name="trash-outline" size={18} color={COLORS.red} /></Pressable>
                       </View>
                       <View style={styles.savedRouteBox}><Text numberOfLines={2} style={styles.savedRoute}>{[flow.code, ...flow.replies].join('  →  ')}</Text></View>
                       <View style={styles.savedActions}>
-                        <Pressable onPress={() => editSavedFlow(flow)} style={styles.editButton}><Ionicons name="create-outline" size={17} color={COLORS.green} /><Text style={styles.editText}>Edit</Text></Pressable>
-                        <Pressable onPress={() => startStepByStep(flow)} style={({ pressed }) => [styles.playButton, pressed && styles.primaryPressed]}><Ionicons name="play" size={16} color={COLORS.green} /><Text style={styles.playButtonText}>Play flow</Text></Pressable>
+                        <Pressable disabled={operationActive} onPress={() => editSavedFlow(flow)} style={[styles.editButton, operationActive && styles.disabled]}><Ionicons name="create-outline" size={17} color={COLORS.green} /><Text style={styles.editText}>Edit</Text></Pressable>
+                        <Pressable disabled={!setupReady || !operationsReady || operationActive} onPress={() => startStepByStep(flow)} style={({ pressed }) => [styles.playButton, (!setupReady || !operationsReady || operationActive) && styles.disabled, pressed && styles.primaryPressed]}><Ionicons name="play" size={16} color={COLORS.green} /><Text style={styles.playButtonText}>{busyAction === 'starting' ? 'Starting' : 'Play flow'}</Text></Pressable>
                       </View>
                     </View>
                   );
@@ -730,9 +1257,11 @@ function UssdFlowApp() {
               <View>
                 <View style={styles.pageHeadingRow}>
                   <View style={styles.pageHeadingCopy}><Text style={styles.kicker}>SESSION LOG</Text><Text style={styles.pageTitle}>History.</Text><Text style={styles.pageSubtitle}>Tap a session to inspect every captured response and reply.</Text></View>
-                  {!!history.length && <Pressable onPress={clearHistory} style={styles.clearButton}><Ionicons name="trash-outline" size={16} color={COLORS.red} /><Text style={styles.clearText}>Clear</Text></Pressable>}
+                  {!!history.length && <Pressable disabled={operationActive} onPress={clearHistory} style={[styles.clearButton, operationActive && styles.disabled]}><Ionicons name="trash-outline" size={16} color={COLORS.red} /><Text style={styles.clearText}>{busyAction === 'clearing' ? 'Clearing' : 'Clear'}</Text></Pressable>}
                 </View>
-                {!history.length ? (
+                {!libraryLoaded && libraryError ? (
+                  <View style={styles.emptyState}><View style={styles.emptyIcon}><Ionicons name="cloud-offline-outline" size={25} color={COLORS.red} /></View><Text style={styles.emptyTitle}>Could not load history</Text><Text style={styles.emptyCopy}>Your sessions were not cleared. Tap Retry above to check again.</Text></View>
+                ) : !history.length ? (
                   <View style={styles.emptyState}><View style={styles.emptyIcon}><Ionicons name="time-outline" size={25} color={COLORS.green} /></View><Text style={styles.emptyTitle}>No sessions yet</Text><Text style={styles.emptyCopy}>Played flows and captured carrier responses will appear here.</Text></View>
                 ) : (
                   <View style={styles.historyTable}>
@@ -746,7 +1275,7 @@ function UssdFlowApp() {
                           <Pressable accessibilityRole="button" accessibilityState={{ expanded }} accessibilityLabel={`${session.flowName}, ${session.status}, ${session.entries.length} responses`} onPress={() => setExpandedSessionId(expanded ? null : session.id)} style={({ pressed }) => [styles.tableRow, pressed && styles.tableRowPressed]}>
                             <View style={styles.flowColumn}><Text numberOfLines={1} style={styles.tableFlow}>{session.flowName}</Text><Text numberOfLines={1} style={styles.tableCode}>{session.code} · {session.entries.length} steps</Text></View>
                             <View style={styles.dateColumn}><Text style={styles.tableDate}>{started.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</Text><Text style={styles.tableTime}>{started.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}</Text></View>
-                            <View style={styles.statusColumn}><View style={[styles.statusPill, session.status === 'cancelled' && styles.statusPillCancelled, (session.status === 'timed_out' || session.status === 'stopped') && styles.statusPillStopped]}><Text style={[styles.statusPillText, session.status === 'cancelled' && styles.statusPillTextCancelled, (session.status === 'timed_out' || session.status === 'stopped') && styles.statusPillTextStopped]}>{session.status === 'timed_out' ? 'TIMEOUT' : session.status.toUpperCase()}</Text></View></View>
+                            <View style={styles.statusColumn}><View style={[styles.statusPill, session.status === 'cancelled' && styles.statusPillCancelled, session.status !== 'completed' && session.status !== 'cancelled' && styles.statusPillStopped]}><Text style={[styles.statusPillText, session.status === 'cancelled' && styles.statusPillTextCancelled, session.status !== 'completed' && session.status !== 'cancelled' && styles.statusPillTextStopped]}>{historyStatusLabel(session.status)}</Text></View></View>
                             <View style={styles.chevronColumn}><Ionicons name={expanded ? 'chevron-up' : 'chevron-down'} size={17} color={COLORS.green} /></View>
                           </Pressable>
                           {expanded && (
@@ -754,7 +1283,7 @@ function UssdFlowApp() {
                               <View style={styles.sessionMetaRow}><View><Text style={styles.sessionMetaLabel}>SIM</Text><Text style={styles.sessionMetaValue}>{sim ? `SIM ${sim.slotIndex + 1} · ${sim.carrierName}` : 'Saved SIM'}</Text></View><View style={styles.sessionMetaRight}><Text style={styles.sessionMetaLabel}>DURATION</Text><Text style={styles.sessionMetaValue}>{session.endedAt > session.startedAt ? `${Math.max(1, Math.round((session.endedAt - session.startedAt) / 1000))} sec` : '—'}</Text></View></View>
                               <Text style={styles.detailHeading}>SESSION DETAILS</Text>
                               <View style={styles.sessionTimeline}>{session.entries.length ? session.entries.map((entry, index) => (
-                                <View key={`${session.id}-${entry.timestamp}-${index}`} style={styles.sessionEntry}><View style={styles.timelineMarker}><Text style={styles.timelineMarkerText}>{index + 1}</Text></View><View style={styles.timelineBody}><Text selectable style={styles.historyResponse}>{entry.response}</Text><Text style={styles.historyAction}>{entry.action === 'cancel' ? 'CANCELLED AFTER RESPONSE' : `REPLIED ${entry.reply}`}</Text></View></View>
+                                <View key={`${session.id}-${entry.timestamp}-${index}`} style={styles.sessionEntry}><View style={styles.timelineMarker}><Text style={styles.timelineMarkerText}>{index + 1}</Text></View><View style={styles.timelineBody}><Text selectable style={styles.historyResponse}>{entry.response}</Text><Text style={styles.historyAction}>{historyActionLabel(entry)}</Text></View></View>
                               )) : <Text style={styles.noDetailText}>No carrier response was captured in this session.</Text>}</View>
                             </View>
                           )}
@@ -803,6 +1332,41 @@ const styles = StyleSheet.create({
   settingsButton: { width: 43, height: 43, borderRadius: 16, borderWidth: 1, borderColor: COLORS.line, backgroundColor: COLORS.surface, alignItems: 'center', justifyContent: 'center' },
   statusDot: { position: 'absolute', right: 7, top: 7, width: 7, height: 7, borderRadius: 4, backgroundColor: COLORS.orange, borderWidth: 1.5, borderColor: COLORS.surface, zIndex: 2 },
   statusDotReady: { backgroundColor: '#57A66B' },
+  permissionBanner: { backgroundColor: COLORS.surface, borderWidth: 1, borderColor: '#E6D8D1', borderRadius: 22, paddingHorizontal: 14, paddingTop: 14, paddingBottom: 3, marginBottom: 2, shadowColor: '#6B3828', shadowOpacity: 0.05, shadowRadius: 12, shadowOffset: { width: 0, height: 5 }, elevation: 2 },
+  permissionBannerHeader: { flexDirection: 'row', alignItems: 'center', paddingBottom: 12 },
+  permissionBannerIcon: { width: 38, height: 38, borderRadius: 13, backgroundColor: COLORS.orangeSoft, alignItems: 'center', justifyContent: 'center', marginRight: 10 },
+  permissionBannerHeading: { flex: 1, minWidth: 0, paddingRight: 7 },
+  permissionBannerTitle: { color: COLORS.ink, fontFamily: 'Manrope_800ExtraBold', fontSize: 14, letterSpacing: -0.25 },
+  permissionBannerCopy: { color: COLORS.muted, fontFamily: 'Manrope_400Regular', fontSize: 9, lineHeight: 13, marginTop: 2 },
+  permissionCountPill: { backgroundColor: COLORS.orangeSoft, borderRadius: 10, paddingHorizontal: 8, paddingVertical: 6 },
+  permissionCountText: { color: COLORS.red, fontFamily: 'Manrope_800ExtraBold', fontSize: 7, letterSpacing: 0.5 },
+  permissionRow: { minHeight: 57, flexDirection: 'row', alignItems: 'center', borderTopWidth: 1, borderTopColor: COLORS.line, paddingVertical: 10 },
+  permissionRowIcon: { width: 31, height: 31, borderRadius: 10, backgroundColor: COLORS.greenSoft, alignItems: 'center', justifyContent: 'center', marginRight: 9 },
+  permissionRowCopy: { flex: 1, minWidth: 0, paddingRight: 7 },
+  permissionRowTitle: { color: COLORS.ink, fontFamily: 'Manrope_700Bold', fontSize: 11 },
+  permissionRowDescription: { color: COLORS.muted, fontFamily: 'Manrope_400Regular', fontSize: 8, lineHeight: 12, marginTop: 2 },
+  permissionAction: { minWidth: 68, height: 44, borderRadius: 13, backgroundColor: COLORS.green, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 10 },
+  permissionActionBusy: { opacity: 0.62 },
+  permissionActionText: { color: COLORS.white, fontFamily: 'Manrope_700Bold', fontSize: 10 },
+  operationBanner: { flexDirection: 'row', alignItems: 'center', backgroundColor: COLORS.greenSoft, borderWidth: 1, borderColor: '#BED9C1', borderRadius: 20, padding: 13, marginTop: 10, marginBottom: 2 },
+  operationBannerTerminal: { backgroundColor: COLORS.surface, borderColor: COLORS.line },
+  operationPulse: { width: 39, height: 39, borderRadius: 13, backgroundColor: COLORS.lime, alignItems: 'center', justifyContent: 'center', marginRight: 10 },
+  operationTerminalIcon: { backgroundColor: COLORS.orangeSoft },
+  operationCopy: { flex: 1, minWidth: 0, paddingRight: 8 },
+  operationEyebrow: { color: COLORS.orange, fontFamily: 'Manrope_800ExtraBold', fontSize: 7, letterSpacing: 1 },
+  operationTitle: { color: COLORS.ink, fontFamily: 'Manrope_800ExtraBold', fontSize: 13, marginTop: 2 },
+  operationDescription: { color: COLORS.muted, fontFamily: 'Manrope_400Regular', fontSize: 9, lineHeight: 13, marginTop: 2 },
+  operationProgress: { color: COLORS.green, fontFamily: 'Manrope_700Bold', fontSize: 8, marginTop: 4 },
+  operationStop: { minWidth: 62, minHeight: 42, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 4, backgroundColor: COLORS.orangeSoft, borderRadius: 13, paddingHorizontal: 9 },
+  operationStopText: { color: COLORS.red, fontFamily: 'Manrope_700Bold', fontSize: 9 },
+  operationDismiss: { width: 40, height: 40, borderRadius: 13, backgroundColor: COLORS.soft, alignItems: 'center', justifyContent: 'center' },
+  recoveryBanner: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#FFF5F0', borderWidth: 1, borderColor: '#F1D1C5', borderRadius: 18, padding: 12, marginTop: 10, marginBottom: 2 },
+  recoveryIcon: { width: 34, height: 34, borderRadius: 11, backgroundColor: COLORS.orangeSoft, alignItems: 'center', justifyContent: 'center', marginRight: 9 },
+  recoveryCopy: { flex: 1, minWidth: 0, paddingRight: 8 },
+  recoveryTitle: { color: COLORS.ink, fontFamily: 'Manrope_800ExtraBold', fontSize: 11 },
+  recoveryText: { color: COLORS.muted, fontFamily: 'Manrope_400Regular', fontSize: 8, lineHeight: 12, marginTop: 2 },
+  recoveryAction: { minWidth: 54, height: 38, borderRadius: 12, backgroundColor: COLORS.green, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 9 },
+  recoveryActionText: { color: COLORS.white, fontFamily: 'Manrope_700Bold', fontSize: 9 },
   pageHeadingRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', marginTop: 18, marginBottom: 24 },
   pageHeadingCopy: { flex: 1, paddingRight: 12 },
   kicker: { color: COLORS.orange, fontFamily: 'Manrope_800ExtraBold', fontSize: 9, letterSpacing: 1.3, marginBottom: 7 },
@@ -880,6 +1444,8 @@ const styles = StyleSheet.create({
   utilityButton: { flex: 1, minHeight: 46, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, borderWidth: 1, borderColor: COLORS.line, borderRadius: 15, backgroundColor: COLORS.surface },
   utilityDisabled: { opacity: 0.43 },
   utilityText: { color: COLORS.green, fontFamily: 'Manrope_600SemiBold', fontSize: 9 },
+  inlineStatus: { flexDirection: 'row', alignItems: 'center', gap: 7, backgroundColor: COLORS.orangeSoft, borderRadius: 14, padding: 11, marginBottom: 10 },
+  inlineStatusText: { flex: 1, color: COLORS.red, fontFamily: 'Manrope_500Medium', fontSize: 9, lineHeight: 13 },
   responsePanel: { backgroundColor: COLORS.green, borderRadius: 21, padding: 17, marginTop: 5, marginBottom: 10 },
   responseHeader: { flexDirection: 'row', alignItems: 'center', gap: 7, marginBottom: 9 },
   responseKicker: { color: COLORS.lime, fontFamily: 'Manrope_800ExtraBold', fontSize: 8, letterSpacing: 1 },

@@ -32,6 +32,8 @@ yarn-error.*
 *.apk
 *.aab
 /artifacts/
+/release-signing/
+/device-ussd-data-backup.xml
 /modules/**/android/build/
 **/.cxx/
 **/.gradle/

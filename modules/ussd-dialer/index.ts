@@ -12,6 +12,18 @@ type UssdDialerModule = {
   openAccessibilitySettings(): Promise<void>;
   startAutomation(code: string, replies: string[], subscriptionId: number, flowName: string): Promise<void>;
   cancelAutomation(): Promise<void>;
+  getAutomationStatus(): Promise<{
+    status: string;
+    sessionId: string;
+    flowName: string;
+    code: string;
+    subscriptionId: number;
+    currentStep: number;
+    totalSteps: number;
+    updatedAt: number;
+    message: string;
+  }>;
+  acknowledgeAutomation(updatedAt: number): Promise<void>;
   startRecording(code: string, subscriptionId: number): Promise<void>;
   finishRecording(): Promise<{ status: string; code: string; subscriptionId: number; replies: string[]; updatedAt: number }>;
   getRecording(): Promise<{ status: string; code: string; subscriptionId: number; replies: string[]; updatedAt: number }>;
