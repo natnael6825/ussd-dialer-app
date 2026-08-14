@@ -1,0 +1,50 @@
+# Dependencies and incomplete local installs
+node_modules/
+node_modules.incomplete/
+/.legacy/
+
+# Expo and generated native projects
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+/android/
+/ios/
+
+# Native build products and signing material
+.kotlin/
+**/.cxx/
+**/.gradle/
+/modules/**/android/build/
+/artifacts/
+/release-signing/
+/device-ussd-data-backup.xml
+*.apk
+*.aab
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+
+# Local screenshots retained from development
+/docs/screenshots/
+
+# Metro, logs, caches, and TypeScript
+.metro-health-check*
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+*.log
+*.tsbuildinfo
+
+# Local environment files
+.env
+.env.*
+!.env.example
+.env*.local
+
+# Miscellaneous
+.DS_Store
+*.pem
