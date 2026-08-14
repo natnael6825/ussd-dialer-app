@@ -10,7 +10,15 @@ internal object FlowTemplates {
 
   fun validateSavedReplies(replies: List<String>): Validation {
     val variables = linkedSetOf<String>()
-    for (reply in replies) {
+    var cancelSeen = false
+    for ((index, reply) in replies.withIndex()) {
+      if (reply.equals("CANCEL", ignoreCase = true)) {
+        if (cancelSeen || index != replies.lastIndex) {
+          return Validation(emptyList(), "CANCEL can appear only once and must be the final step.")
+        }
+        cancelSeen = true
+        continue
+      }
       val match = placeholder.matchEntire(reply)
       if (match != null) {
         val name = match.groupValues[1]

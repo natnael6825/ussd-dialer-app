@@ -183,7 +183,7 @@ function historyStatusLabel(status: string) {
 }
 
 function historyActionLabel(entry: HistoryEntry) {
-  if (entry.action === 'cancel') return 'CANCELLED AFTER RESPONSE';
+  if (entry.action === 'cancel') return 'FLOW ENDED WITH CANCEL';
   if (entry.action === 'complete') return 'FINAL RESPONSE';
   if (entry.action === 'ended') return 'SESSION ENDED';
   if (entry.action === 'failed') return 'CARRIER FAILURE';
@@ -300,6 +300,10 @@ function UssdFlowApp() {
       + Number(!accessibilityEnabled)
     : 0;
   const automationActive = ACTIVE_AUTOMATION_STATUSES.has(automation.status);
+  const automationDisplayStatus = automation.status === 'cancelled'
+    && /saved flow|cancel step/i.test(automation.message)
+    ? 'completed'
+    : automation.status;
   const automationTerminal = automationStatusKnown
     && !automationActive
     && !CALM_AUTOMATION_STATUSES.has(automation.status);
@@ -705,7 +709,9 @@ function UssdFlowApp() {
     if (recording.replies.length) setSteps(recording.replies);
     if (!showNotice) return;
     const count = recording.replies.length;
-    const partial = ['cancelled', 'timed_out', 'interrupted', 'failed', 'stopped'].includes(recording.status);
+    const completedWithCancel = recording.status === 'cancelled'
+      && recording.replies.at(-1)?.trim().toUpperCase() === 'CANCEL';
+    const partial = !completedWithCancel && ['cancelled', 'timed_out', 'interrupted', 'failed', 'stopped'].includes(recording.status);
     const title = recording.status === 'timed_out'
       ? 'Recording timed out'
       : recording.status === 'interrupted'
@@ -752,11 +758,16 @@ function UssdFlowApp() {
   }
 
   function addStep() {
-    setSteps((current) => [...current, '']);
+    setSteps((current) => current.at(-1)?.trim().toUpperCase() === 'CANCEL'
+      ? [...current.slice(0, -1), '', current[current.length - 1]]
+      : [...current, '']);
   }
 
   function addCancelStep() {
-    setSteps((current) => [...current, 'CANCEL']);
+    setSteps((current) => [
+      ...current.filter((step) => step.trim().toUpperCase() !== 'CANCEL'),
+      'CANCEL',
+    ]);
   }
 
   function removeStep(index: number) {
@@ -1452,11 +1463,11 @@ function UssdFlowApp() {
             {automationTerminal && (
               <View accessibilityLiveRegion="polite" style={[styles.operationBanner, styles.operationBannerTerminal]}>
                 <View style={[styles.operationPulse, styles.operationTerminalIcon]}>
-                  <Ionicons name={automation.status === 'completed' ? 'checkmark' : 'alert'} size={17} color={automation.status === 'completed' ? COLORS.green : COLORS.red} />
+                  <Ionicons name={automationDisplayStatus === 'completed' ? 'checkmark' : 'alert'} size={17} color={automationDisplayStatus === 'completed' ? COLORS.green : COLORS.red} />
                 </View>
                 <View style={styles.operationCopy}>
                   <Text style={styles.operationEyebrow}>LAST SESSION</Text>
-                  <Text style={styles.operationTitle}>{automationStatusTitle(automation.status)}</Text>
+                  <Text style={styles.operationTitle}>{automationStatusTitle(automationDisplayStatus)}</Text>
                   <Text style={styles.operationDescription}>{automation.message || `${automationProgress}. Confirm the carrier dialog is closed before retrying.`}</Text>
                 </View>
                 <Pressable disabled={busyAction === 'dismissing'} onPress={dismissAutomationResult} style={styles.operationDismiss}>
@@ -1883,12 +1894,14 @@ function UssdFlowApp() {
                       const expanded = expandedSessionId === session.id;
                       const started = new Date(session.startedAt);
                       const sim = simOptions.find((option) => option.id === session.subscriptionId);
+                      const endedWithCancel = session.status === 'cancelled' && session.entries.at(-1)?.action === 'cancel';
+                      const visibleStatus = endedWithCancel ? 'completed' : session.status;
                       return (
                         <View key={session.id} style={[styles.historyRowGroup, expanded && styles.historyRowGroupExpanded]}>
-                          <Pressable accessibilityRole="button" accessibilityState={{ expanded }} accessibilityLabel={`${session.flowName}, ${session.status}, ${session.entries.length} responses`} onPress={() => setExpandedSessionId(expanded ? null : session.id)} style={({ pressed }) => [styles.tableRow, pressed && styles.tableRowPressed]}>
+                          <Pressable accessibilityRole="button" accessibilityState={{ expanded }} accessibilityLabel={`${session.flowName}, ${visibleStatus}, ${session.entries.length} responses`} onPress={() => setExpandedSessionId(expanded ? null : session.id)} style={({ pressed }) => [styles.tableRow, pressed && styles.tableRowPressed]}>
                             <View style={styles.flowColumn}><Text numberOfLines={1} style={styles.tableFlow}>{session.flowName}</Text><Text numberOfLines={1} style={styles.tableCode}>{session.code} · {session.entries.length} steps</Text></View>
                             <View style={styles.dateColumn}><Text style={styles.tableDate}>{started.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</Text><Text style={styles.tableTime}>{started.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}</Text></View>
-                            <View style={styles.statusColumn}><View style={[styles.statusPill, session.status === 'cancelled' && styles.statusPillCancelled, session.status !== 'completed' && session.status !== 'cancelled' && styles.statusPillStopped]}><Text style={[styles.statusPillText, session.status === 'cancelled' && styles.statusPillTextCancelled, session.status !== 'completed' && session.status !== 'cancelled' && styles.statusPillTextStopped]}>{historyStatusLabel(session.status)}</Text></View></View>
+                            <View style={styles.statusColumn}><View style={[styles.statusPill, visibleStatus === 'cancelled' && styles.statusPillCancelled, visibleStatus !== 'completed' && visibleStatus !== 'cancelled' && styles.statusPillStopped]}><Text style={[styles.statusPillText, visibleStatus === 'cancelled' && styles.statusPillTextCancelled, visibleStatus !== 'completed' && visibleStatus !== 'cancelled' && styles.statusPillTextStopped]}>{historyStatusLabel(visibleStatus)}</Text></View></View>
                             <View style={styles.chevronColumn}><Ionicons name={expanded ? 'chevron-up' : 'chevron-down'} size={17} color={COLORS.green} /></View>
                           </Pressable>
                           {expanded && (

@@ -176,7 +176,7 @@ class UssdAutomationService : AccessibilityService() {
             Toast.makeText(this, "USSD was cancelled, but its history could not be saved", Toast.LENGTH_SHORT).show()
             return@Runnable
           }
-          Toast.makeText(this, "USSD Flow cancelled the session", Toast.LENGTH_SHORT).show()
+          Toast.makeText(this, "USSD flow completed with its saved CANCEL step", Toast.LENGTH_SHORT).show()
           return@Runnable
         }
 
@@ -352,14 +352,15 @@ class UssdAutomationService : AccessibilityService() {
 
   private fun handleRecordingClick(event: AccessibilityEvent) {
     val clicked = event.source ?: return
-    val state = UssdAutomationStore.getRecordingCaptureState(this) ?: return
     val eventPackage = event.packageName?.toString().orEmpty()
     val sourcePackage = clicked.packageName?.toString().orEmpty()
-    if (state.recordingId != recordingId || state.windowId < 0 || event.windowId < 0 || clicked.windowId < 0 ||
-      eventPackage != state.packageName || sourcePackage != state.packageName ||
-      event.windowId != state.windowId || clicked.windowId != state.windowId) {
-      return
-    }
+    if (eventPackage !in ALLOWED_PACKAGES || eventPackage != sourcePackage ||
+      event.windowId < 0 || clicked.windowId != event.windowId) return
+    val candidate = UssdAutomationStore.getRecordingClickCandidate(
+      this, eventPackage, event.windowId, event.eventTime
+    ) ?: return
+    val state = candidate.state
+    if (state.recordingId != recordingId) return
 
     val action = when {
       state.isInteractive && state.hasCancel && matchesControlClick(clicked, CANCEL_LABELS) -> RecordingClickAction.CANCEL
@@ -367,11 +368,11 @@ class UssdAutomationService : AccessibilityService() {
       !state.isInteractive && state.hasFinish && matchesControlClick(clicked, FINISH_LABELS) -> RecordingClickAction.FINISH
       else -> return
     }
-    when (UssdAutomationStore.recordRecordingClick(this, state, action, event.eventTime)) {
+    when (UssdAutomationStore.recordRecordingClick(this, candidate, action, event.eventTime)) {
       RecordingCommitResult.RECORDED -> {
         if (action == RecordingClickAction.CANCEL) {
           resetRecordingMemory()
-          Toast.makeText(this, "USSD Flow recorded CANCEL", Toast.LENGTH_SHORT).show()
+          Toast.makeText(this, "USSD recording completed with CANCEL", Toast.LENGTH_SHORT).show()
         } else {
           Toast.makeText(this, "Reply recorded", Toast.LENGTH_SHORT).show()
         }
@@ -535,6 +536,13 @@ internal data class RecordingCaptureState(
   val draftEventTime: Long
 )
 
+internal data class RecordingClickCandidate(
+  val state: RecordingCaptureState,
+  val isPrevious: Boolean,
+  val supersededEventTime: Long,
+  val validUntilEventTime: Long
+)
+
 internal object UssdAutomationStore {
   private const val PREFS = "ussd_automation"
   private const val KEYSTORE_PROVIDER = "AndroidKeyStore"
@@ -596,6 +604,22 @@ internal object UssdAutomationStore {
   private const val KEY_RECORDING_COMMITTED_WINDOW_ID = "recording_committed_window_id"
   private const val KEY_RECORDING_POST_COMMIT_GAP = "recording_post_commit_gap"
   private const val KEY_RECORDING_LAST_COMMIT_EVENT_TIME = "recording_last_commit_event_time"
+  private const val KEY_RECORDING_PREVIOUS_PACKAGE = "recording_previous_package"
+  private const val KEY_RECORDING_PREVIOUS_RECORDING_ID = "recording_previous_recording_id"
+  private const val KEY_RECORDING_PREVIOUS_WINDOW_ID = "recording_previous_window_id"
+  private const val KEY_RECORDING_PREVIOUS_FINGERPRINT = "recording_previous_fingerprint"
+  private const val KEY_RECORDING_PREVIOUS_EPOCH = "recording_previous_epoch"
+  private const val KEY_RECORDING_PREVIOUS_INTERACTIVE = "recording_previous_interactive"
+  private const val KEY_RECORDING_PREVIOUS_HAS_SEND = "recording_previous_has_send"
+  private const val KEY_RECORDING_PREVIOUS_HAS_CANCEL = "recording_previous_has_cancel"
+  private const val KEY_RECORDING_PREVIOUS_HAS_FINISH = "recording_previous_has_finish"
+  private const val KEY_RECORDING_PREVIOUS_PASSWORD = "recording_previous_password"
+  private const val KEY_RECORDING_PREVIOUS_AWAITING = "recording_previous_awaiting"
+  private const val KEY_RECORDING_PREVIOUS_OBSERVED_EVENT_TIME = "recording_previous_observed_event_time"
+  private const val KEY_RECORDING_PREVIOUS_DRAFT = "recording_previous_draft"
+  private const val KEY_RECORDING_PREVIOUS_DRAFT_EVENT_TIME = "recording_previous_draft_event_time"
+  private const val KEY_RECORDING_PREVIOUS_SUPERSEDED_EVENT_TIME = "recording_previous_superseded_event_time"
+  private const val KEY_RECORDING_PREVIOUS_VALID_UNTIL_EVENT_TIME = "recording_previous_valid_until_event_time"
   private const val KEY_BACKEND_BASE_URL = "backend_base_url"
   private const val KEY_BACKEND_DEVICE_ID = "backend_device_id"
   private const val KEY_BACKEND_DEVICE_NAME = "backend_device_name"
@@ -611,6 +635,7 @@ internal object UssdAutomationStore {
   private const val KEY_BACKEND_CONFIGURATION_GENERATION = "backend_configuration_generation"
   private const val AUTOMATION_STEP_TIMEOUT_MS = 120_000L
   private const val RECORDING_TIMEOUT_MS = 300_000L
+  private const val DELAYED_CLICK_CANDIDATE_MS = 5_000L
 
   private val migrationLock = Any()
   private val stateLock = Any()
@@ -697,26 +722,45 @@ internal object UssdAutomationStore {
   private fun preferences(context: Context): SecurePreferences =
     SecurePreferences(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE))
 
-  private fun clearRecordingCapture(editor: SecureEditor): SecureEditor = editor
-    .remove(KEY_RECORDING_DRAFT)
-    .remove(KEY_RECORDING_DRAFT_SIGNATURE)
-    .remove(KEY_RECORDING_DRAFT_EVENT_TIME)
-    .remove(KEY_RECORDING_LAST_COMMIT_TOKEN)
-    .remove(KEY_RECORDING_MENU_PACKAGE)
-    .remove(KEY_RECORDING_MENU_WINDOW_ID)
-    .remove(KEY_RECORDING_MENU_FINGERPRINT)
-    .remove(KEY_RECORDING_MENU_EPOCH)
-    .remove(KEY_RECORDING_MENU_INTERACTIVE)
-    .remove(KEY_RECORDING_MENU_HAS_SEND)
-    .remove(KEY_RECORDING_MENU_HAS_CANCEL)
-    .remove(KEY_RECORDING_MENU_HAS_FINISH)
-    .remove(KEY_RECORDING_MENU_PASSWORD)
-    .remove(KEY_RECORDING_MENU_EVENT_TIME)
-    .remove(KEY_RECORDING_AWAITING_NEXT_MENU)
-    .remove(KEY_RECORDING_COMMITTED_FINGERPRINT)
-    .remove(KEY_RECORDING_COMMITTED_WINDOW_ID)
-    .remove(KEY_RECORDING_POST_COMMIT_GAP)
-    .remove(KEY_RECORDING_LAST_COMMIT_EVENT_TIME)
+  private fun clearPreviousClickCandidate(editor: SecureEditor): SecureEditor = editor
+    .remove(KEY_RECORDING_PREVIOUS_RECORDING_ID)
+    .remove(KEY_RECORDING_PREVIOUS_PACKAGE)
+    .remove(KEY_RECORDING_PREVIOUS_WINDOW_ID)
+    .remove(KEY_RECORDING_PREVIOUS_FINGERPRINT)
+    .remove(KEY_RECORDING_PREVIOUS_EPOCH)
+    .remove(KEY_RECORDING_PREVIOUS_INTERACTIVE)
+    .remove(KEY_RECORDING_PREVIOUS_HAS_SEND)
+    .remove(KEY_RECORDING_PREVIOUS_HAS_CANCEL)
+    .remove(KEY_RECORDING_PREVIOUS_HAS_FINISH)
+    .remove(KEY_RECORDING_PREVIOUS_PASSWORD)
+    .remove(KEY_RECORDING_PREVIOUS_AWAITING)
+    .remove(KEY_RECORDING_PREVIOUS_OBSERVED_EVENT_TIME)
+    .remove(KEY_RECORDING_PREVIOUS_DRAFT)
+    .remove(KEY_RECORDING_PREVIOUS_DRAFT_EVENT_TIME)
+    .remove(KEY_RECORDING_PREVIOUS_SUPERSEDED_EVENT_TIME)
+    .remove(KEY_RECORDING_PREVIOUS_VALID_UNTIL_EVENT_TIME)
+
+  private fun clearRecordingCapture(editor: SecureEditor): SecureEditor =
+    clearPreviousClickCandidate(editor
+      .remove(KEY_RECORDING_DRAFT)
+      .remove(KEY_RECORDING_DRAFT_SIGNATURE)
+      .remove(KEY_RECORDING_DRAFT_EVENT_TIME)
+      .remove(KEY_RECORDING_LAST_COMMIT_TOKEN)
+      .remove(KEY_RECORDING_MENU_PACKAGE)
+      .remove(KEY_RECORDING_MENU_WINDOW_ID)
+      .remove(KEY_RECORDING_MENU_FINGERPRINT)
+      .remove(KEY_RECORDING_MENU_EPOCH)
+      .remove(KEY_RECORDING_MENU_INTERACTIVE)
+      .remove(KEY_RECORDING_MENU_HAS_SEND)
+      .remove(KEY_RECORDING_MENU_HAS_CANCEL)
+      .remove(KEY_RECORDING_MENU_HAS_FINISH)
+      .remove(KEY_RECORDING_MENU_PASSWORD)
+      .remove(KEY_RECORDING_MENU_EVENT_TIME)
+      .remove(KEY_RECORDING_AWAITING_NEXT_MENU)
+      .remove(KEY_RECORDING_COMMITTED_FINGERPRINT)
+      .remove(KEY_RECORDING_COMMITTED_WINDOW_ID)
+      .remove(KEY_RECORDING_POST_COMMIT_GAP)
+      .remove(KEY_RECORDING_LAST_COMMIT_EVENT_TIME))
 
   private fun clearRecordingTerminalState(editor: SecureEditor): SecureEditor =
     clearRecordingCapture(editor).remove(KEY_RECORDING_BOOT_COUNT)
@@ -744,6 +788,22 @@ internal object UssdAutomationStore {
       .remove(KEY_RECORDING_COMMITTED_WINDOW_ID)
       .remove(KEY_RECORDING_POST_COMMIT_GAP)
       .remove(KEY_RECORDING_LAST_COMMIT_EVENT_TIME)
+      .remove(KEY_RECORDING_PREVIOUS_PACKAGE)
+      .remove(KEY_RECORDING_PREVIOUS_RECORDING_ID)
+      .remove(KEY_RECORDING_PREVIOUS_WINDOW_ID)
+      .remove(KEY_RECORDING_PREVIOUS_FINGERPRINT)
+      .remove(KEY_RECORDING_PREVIOUS_EPOCH)
+      .remove(KEY_RECORDING_PREVIOUS_INTERACTIVE)
+      .remove(KEY_RECORDING_PREVIOUS_HAS_SEND)
+      .remove(KEY_RECORDING_PREVIOUS_HAS_CANCEL)
+      .remove(KEY_RECORDING_PREVIOUS_HAS_FINISH)
+      .remove(KEY_RECORDING_PREVIOUS_PASSWORD)
+      .remove(KEY_RECORDING_PREVIOUS_AWAITING)
+      .remove(KEY_RECORDING_PREVIOUS_OBSERVED_EVENT_TIME)
+      .remove(KEY_RECORDING_PREVIOUS_DRAFT)
+      .remove(KEY_RECORDING_PREVIOUS_DRAFT_EVENT_TIME)
+      .remove(KEY_RECORDING_PREVIOUS_SUPERSEDED_EVENT_TIME)
+      .remove(KEY_RECORDING_PREVIOUS_VALID_UNTIL_EVENT_TIME)
       .commit()
   }
 
@@ -1058,17 +1118,20 @@ internal object UssdAutomationStore {
     val sessions = readSessions(prefs)
     val sessionId = prefs.getString(KEY_SESSION_ID, "").orEmpty()
     val currentStep = prefs.getInt(KEY_INDEX, 0)
+    val totalSteps = prefs.getInt(KEY_TOTAL_STEPS, 0)
     appendHistoryEntry(sessions, sessionId, now, currentStep, reply, response, if (cancel) "cancel" else "reply")
 
     if (cancel) {
-      finishSessionInMemory(sessions, sessionId, "cancelled", now)
+      finishSessionInMemory(sessions, sessionId, "completed", now)
       return@synchronized prefs.edit()
         .putString(KEY_HISTORY, sessions.toString())
         .putBoolean(KEY_ARMED, false)
+        .putBoolean(KEY_STARTED, true)
+        .putInt(KEY_INDEX, (currentStep + 1).coerceAtMost(totalSteps))
         .putBoolean(KEY_ACTION_PENDING, false)
         .putBoolean(KEY_AWAITING_RESPONSE, false)
-        .putString(KEY_AUTOMATION_STATUS, "cancelled")
-        .putString(KEY_AUTOMATION_MESSAGE, "USSD session was cancelled by the saved flow.")
+        .putString(KEY_AUTOMATION_STATUS, "completed")
+        .putString(KEY_AUTOMATION_MESSAGE, "USSD flow completed with its saved CANCEL step")
         .putLong(KEY_AUTOMATION_UPDATED, now)
         .remove(KEY_ACTION_SIGNATURE)
         .remove(KEY_ACTION_STARTED)
@@ -1079,7 +1142,6 @@ internal object UssdAutomationStore {
     }
 
     val nextStep = currentStep + 1
-    val totalSteps = prefs.getInt(KEY_TOTAL_STEPS, 0)
     val waitMessage = if (nextStep >= totalSteps) {
       "Waiting for the final USSD response."
     } else {
@@ -1474,8 +1536,101 @@ internal object UssdAutomationStore {
     )
   }
 
+  private fun previousClickCandidateLocked(prefs: SecurePreferences): RecordingClickCandidate? {
+    if (!prefs.getBoolean(KEY_RECORDING, false)) return null
+    val recordingId = prefs.getLong(KEY_RECORDING_PREVIOUS_RECORDING_ID, 0L)
+    if (recordingId != prefs.getLong(KEY_RECORDING_ID, 0L)) return null
+    val packageName = prefs.getString(KEY_RECORDING_PREVIOUS_PACKAGE, "").orEmpty()
+    val windowId = prefs.getInt(KEY_RECORDING_PREVIOUS_WINDOW_ID, -1)
+    val fingerprint = prefs.getString(KEY_RECORDING_PREVIOUS_FINGERPRINT, "").orEmpty()
+    val epoch = prefs.getInt(KEY_RECORDING_PREVIOUS_EPOCH, 0)
+    val observedEventTime = prefs.getLong(KEY_RECORDING_PREVIOUS_OBSERVED_EVENT_TIME, 0L)
+    val supersededEventTime = prefs.getLong(KEY_RECORDING_PREVIOUS_SUPERSEDED_EVENT_TIME, 0L)
+    val validUntilEventTime = prefs.getLong(KEY_RECORDING_PREVIOUS_VALID_UNTIL_EVENT_TIME, 0L)
+    if (recordingId <= 0L || packageName.isEmpty() || windowId < 0 || fingerprint.isEmpty() || epoch <= 0 ||
+      observedEventTime <= 0L || supersededEventTime < observedEventTime || validUntilEventTime < supersededEventTime) {
+      return null
+    }
+    return RecordingClickCandidate(
+      RecordingCaptureState(
+        recordingId,
+        packageName,
+        windowId,
+        fingerprint,
+        epoch,
+        prefs.getBoolean(KEY_RECORDING_PREVIOUS_INTERACTIVE, false),
+        prefs.getBoolean(KEY_RECORDING_PREVIOUS_HAS_SEND, false),
+        prefs.getBoolean(KEY_RECORDING_PREVIOUS_HAS_CANCEL, false),
+        prefs.getBoolean(KEY_RECORDING_PREVIOUS_HAS_FINISH, false),
+        prefs.getBoolean(KEY_RECORDING_PREVIOUS_PASSWORD, false),
+        prefs.getBoolean(KEY_RECORDING_PREVIOUS_AWAITING, false),
+        observedEventTime,
+        prefs.getString(KEY_RECORDING_PREVIOUS_DRAFT, "").orEmpty(),
+        prefs.getLong(KEY_RECORDING_PREVIOUS_DRAFT_EVENT_TIME, 0L)
+      ),
+      true,
+      supersededEventTime,
+      validUntilEventTime
+    )
+  }
+
+  private fun putPreviousClickCandidate(
+    editor: SecureEditor,
+    state: RecordingCaptureState,
+    supersededEventTime: Long
+  ): SecureEditor {
+    val validUntil = if (supersededEventTime > Long.MAX_VALUE - DELAYED_CLICK_CANDIDATE_MS) {
+      Long.MAX_VALUE
+    } else supersededEventTime + DELAYED_CLICK_CANDIDATE_MS
+    return editor
+      .putLong(KEY_RECORDING_PREVIOUS_RECORDING_ID, state.recordingId)
+      .putString(KEY_RECORDING_PREVIOUS_PACKAGE, state.packageName)
+      .putInt(KEY_RECORDING_PREVIOUS_WINDOW_ID, state.windowId)
+      .putString(KEY_RECORDING_PREVIOUS_FINGERPRINT, state.fingerprint)
+      .putInt(KEY_RECORDING_PREVIOUS_EPOCH, state.epoch)
+      .putBoolean(KEY_RECORDING_PREVIOUS_INTERACTIVE, state.isInteractive)
+      .putBoolean(KEY_RECORDING_PREVIOUS_HAS_SEND, state.hasSend)
+      .putBoolean(KEY_RECORDING_PREVIOUS_HAS_CANCEL, state.hasCancel)
+      .putBoolean(KEY_RECORDING_PREVIOUS_HAS_FINISH, state.hasFinish)
+      .putBoolean(KEY_RECORDING_PREVIOUS_PASSWORD, state.isPasswordInput)
+      .putBoolean(KEY_RECORDING_PREVIOUS_AWAITING, state.awaitingNextMenu)
+      .putLong(KEY_RECORDING_PREVIOUS_OBSERVED_EVENT_TIME, state.observedEventTime)
+      .putString(KEY_RECORDING_PREVIOUS_DRAFT, state.draft)
+      .putLong(KEY_RECORDING_PREVIOUS_DRAFT_EVENT_TIME, state.draftEventTime)
+      .putLong(KEY_RECORDING_PREVIOUS_SUPERSEDED_EVENT_TIME, supersededEventTime)
+      .putLong(KEY_RECORDING_PREVIOUS_VALID_UNTIL_EVENT_TIME, validUntil)
+  }
+
+  private fun recordingClickCandidateLocked(
+    prefs: SecurePreferences,
+    packageName: String,
+    windowId: Int,
+    eventTime: Long
+  ): RecordingClickCandidate? {
+    if (eventTime <= 0L || packageName.isEmpty() || windowId < 0) return null
+    val current = recordingCaptureStateLocked(prefs)
+    if (current != null && current.packageName == packageName && current.windowId == windowId &&
+      current.observedEventTime > 0L && current.observedEventTime <= eventTime) {
+      return RecordingClickCandidate(current, false, Long.MAX_VALUE, Long.MAX_VALUE)
+    }
+    val previous = previousClickCandidateLocked(prefs) ?: return null
+    if (previous.state.packageName != packageName || previous.state.windowId != windowId ||
+      previous.state.observedEventTime > eventTime || eventTime > previous.supersededEventTime ||
+      android.os.SystemClock.uptimeMillis() > previous.validUntilEventTime) return null
+    return previous
+  }
+
   fun getRecordingCaptureState(context: Context): RecordingCaptureState? = synchronized(stateLock) {
     recordingCaptureStateLocked(preferences(context))
+  }
+
+  fun getRecordingClickCandidate(
+    context: Context,
+    packageName: String,
+    windowId: Int,
+    eventTime: Long
+  ): RecordingClickCandidate? = synchronized(stateLock) {
+    recordingClickCandidateLocked(preferences(context), packageName, windowId, eventTime)
   }
 
   private fun saveRecordingCaptureLocked(
@@ -1486,7 +1641,10 @@ internal object UssdAutomationStore {
     postCommitGap: Boolean,
     draft: String,
     draftEventTime: Long,
-    clearCommittedMenu: Boolean
+    clearCommittedMenu: Boolean,
+    supersededCandidate: RecordingCaptureState? = null,
+    supersededEventTime: Long = 0L,
+    clearPreviousCandidate: Boolean = false
   ): Boolean {
     val state = RecordingCaptureState(
       observation.recordingId,
@@ -1532,7 +1690,42 @@ internal object UssdAutomationStore {
         .remove(KEY_RECORDING_LAST_COMMIT_EVENT_TIME)
         .putBoolean(KEY_RECORDING_POST_COMMIT_GAP, false)
     }
+    if (clearPreviousCandidate) {
+      clearPreviousClickCandidate(editor)
+    } else if (supersededCandidate != null && supersededEventTime >= supersededCandidate.observedEventTime) {
+      val retained = previousClickCandidateLocked(prefs)
+      val retainExistingDraft = retained != null && retained.state.draft.isNotEmpty() &&
+        android.os.SystemClock.uptimeMillis() <= retained.validUntilEventTime
+      if (!retainExistingDraft) putPreviousClickCandidate(editor, supersededCandidate, supersededEventTime)
+    }
     return editor.commit()
+  }
+
+  /**
+   * Some OEM phone apps replace the USSD window without emitting a usable
+   * TYPE_VIEW_CLICKED event for their Send control. A transition from one
+   * validated USSD menu to another validated menu (or its terminal result)
+   * is strong evidence that the non-empty reply from the previous menu was
+   * accepted. Persist it with the same token used by the click path so a late
+   * click callback is idempotent and cannot append the reply twice.
+   */
+  private fun commitReplyConfirmedByTransitionLocked(
+    prefs: SecurePreferences,
+    previous: RecordingCaptureState
+  ): Boolean {
+    if (!previous.isInteractive || !previous.hasSend || previous.isPasswordInput ||
+      previous.awaitingNextMenu || previous.draft.isEmpty() || previous.draftEventTime <= 0L) {
+      return true
+    }
+    val commitToken = "${previous.recordingId}|${previous.epoch}|send"
+    if (prefs.getString(KEY_RECORDING_LAST_COMMIT_TOKEN, "") == commitToken) return true
+    val replies = safeJsonArray(prefs.getString(KEY_RECORDING_REPLIES, "[]"))
+    replies.put(previous.draft)
+    return prefs.edit()
+      .putString(KEY_RECORDING_REPLIES, replies.toString())
+      .putString(KEY_RECORDING_LAST_COMMIT_TOKEN, commitToken)
+      .putLong(KEY_RECORDING_UPDATED, System.currentTimeMillis())
+      .commit()
   }
 
   fun observeRecordingWindow(
@@ -1550,25 +1743,51 @@ internal object UssdAutomationStore {
       val draft = if (observation.isInteractive && !observation.isPasswordInput) observation.inputText.orEmpty() else ""
       val saved = saveRecordingCaptureLocked(
         prefs, observation, 1, false, false, draft,
-        if (draft.isEmpty()) 0L else observation.eventTime, true
+        if (draft.isEmpty()) 0L else observation.eventTime, true,
+        clearPreviousCandidate = true
       )
       return@synchronized if (saved) RecordingObservationResult.UPDATED else RecordingObservationResult.FAILED
     }
     if (observation.eventTime < previous.observedEventTime) return@synchronized RecordingObservationResult.IGNORED
 
     if (!previous.awaitingNextMenu) {
-      val identityChanged = previous.packageName != observation.packageName ||
-        previous.windowId != observation.windowId || previous.fingerprint != observation.fingerprint
-      val epoch = if (identityChanged) previous.epoch + 1 else previous.epoch
       val textChanged = observation.eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED
+      val sameIdentity = previous.packageName == observation.packageName &&
+        previous.windowId == observation.windowId && previous.fingerprint == observation.fingerprint
+      val sameStructure = previous.isInteractive == observation.isInteractive &&
+        previous.hasSend == observation.hasSend && previous.hasCancel == observation.hasCancel &&
+        previous.hasFinish == observation.hasFinish && previous.isPasswordInput == observation.isPasswordInput
+      val incomingDraft = if (observation.isInteractive && !observation.isPasswordInput) {
+        observation.inputText.orEmpty()
+      } else ""
+
+      // Content/state events commonly report a blank input after the user has already
+      // tapped Send but before Android delivers TYPE_VIEW_CLICKED. They are not strong
+      // enough to erase the click candidate or move its event-time boundary.
+      if (sameIdentity && sameStructure && previous.draft.isNotEmpty() && !textChanged && incomingDraft.isEmpty()) {
+        return@synchronized RecordingObservationResult.IGNORED
+      }
+      if (sameIdentity && sameStructure && incomingDraft == previous.draft) {
+        return@synchronized RecordingObservationResult.IGNORED
+      }
+
+      // A different validated USSD screen confirms that the previous menu was
+      // submitted even on OEMs that omit the Send click accessibility event.
+      // Same-screen text/content churn is deliberately excluded.
+      if (!sameIdentity && !commitReplyConfirmedByTransitionLocked(prefs, previous)) {
+        return@synchronized RecordingObservationResult.FAILED
+      }
+
       val draft = when {
         !observation.isInteractive || observation.isPasswordInput -> ""
-        identityChanged && !textChanged -> ""
-        else -> observation.inputText.orEmpty()
+        !sameIdentity && !textChanged -> ""
+        else -> incomingDraft
       }
       val saved = saveRecordingCaptureLocked(
-        prefs, observation, epoch, false, false, draft,
-        if (draft.isEmpty()) 0L else observation.eventTime, true
+        prefs, observation, previous.epoch + 1, false, false, draft,
+        if (draft.isEmpty()) 0L else observation.eventTime, true,
+        supersededCandidate = previous,
+        supersededEventTime = observation.eventTime
       )
       return@synchronized if (saved) RecordingObservationResult.UPDATED else RecordingObservationResult.FAILED
     }
@@ -1579,7 +1798,9 @@ internal object UssdAutomationStore {
     }
     if (!observation.isInteractive) {
       val saved = saveRecordingCaptureLocked(
-        prefs, observation, previous.epoch, true, true, "", 0L, false
+        prefs, observation, previous.epoch, true, true, "", 0L, false,
+        supersededCandidate = previous,
+        supersededEventTime = observation.eventTime
       )
       return@synchronized if (saved) RecordingObservationResult.UPDATED else RecordingObservationResult.FAILED
     }
@@ -1600,29 +1821,32 @@ internal object UssdAutomationStore {
     val draft = if (textChanged && !observation.isPasswordInput) observation.inputText.orEmpty() else ""
     val saved = saveRecordingCaptureLocked(
       prefs, observation, previous.epoch + 1, false, false, draft,
-      if (draft.isEmpty()) 0L else observation.eventTime, true
+      if (draft.isEmpty()) 0L else observation.eventTime, true,
+      supersededCandidate = previous,
+      supersededEventTime = observation.eventTime
     )
     if (saved) RecordingObservationResult.UPDATED else RecordingObservationResult.FAILED
   }
 
   fun recordRecordingClick(
     context: Context,
-    expected: RecordingCaptureState,
+    expected: RecordingClickCandidate,
     action: RecordingClickAction,
     eventTime: Long
   ): RecordingCommitResult = synchronized(stateLock) {
     val prefs = preferences(context)
     if (!prefs.getBoolean(KEY_RECORDING, false)) return@synchronized RecordingCommitResult.INACTIVE
     val current = recordingCaptureStateLocked(prefs) ?: return@synchronized RecordingCommitResult.STALE
-    if (eventTime <= 0L || eventTime < current.observedEventTime ||
-      current.recordingId != expected.recordingId || current.packageName != expected.packageName ||
-      current.windowId != expected.windowId || current.fingerprint != expected.fingerprint ||
-      current.epoch != expected.epoch || current.isInteractive != expected.isInteractive) {
+    val resolved = recordingClickCandidateLocked(
+      prefs, expected.state.packageName, expected.state.windowId, eventTime
+    ) ?: return@synchronized RecordingCommitResult.STALE
+    if (resolved != expected || current.recordingId != resolved.state.recordingId) {
       return@synchronized RecordingCommitResult.STALE
     }
+    val target = resolved.state
 
     if (action == RecordingClickAction.FINISH) {
-      if (current.isInteractive || !current.hasFinish) return@synchronized RecordingCommitResult.STALE
+      if (target.isInteractive || !target.hasFinish) return@synchronized RecordingCommitResult.STALE
       val editor = prefs.edit()
         .putBoolean(KEY_RECORDING, false)
         .putString(KEY_RECORDING_STATUS, "completed")
@@ -1633,12 +1857,12 @@ internal object UssdAutomationStore {
     }
 
     if (action == RecordingClickAction.CANCEL) {
-      if (!current.isInteractive || !current.hasCancel) return@synchronized RecordingCommitResult.STALE
+      if (!target.isInteractive || !target.hasCancel) return@synchronized RecordingCommitResult.STALE
       val replies = safeJsonArray(prefs.getString(KEY_RECORDING_REPLIES, "[]"))
       replies.put("CANCEL")
       val editor = prefs.edit()
         .putBoolean(KEY_RECORDING, false)
-        .putString(KEY_RECORDING_STATUS, "cancelled")
+        .putString(KEY_RECORDING_STATUS, "completed")
         .putString(KEY_RECORDING_REPLIES, replies.toString())
         .putLong(KEY_RECORDING_UPDATED, System.currentTimeMillis())
       return@synchronized if (clearRecordingTerminalState(editor).commit()) {
@@ -1646,37 +1870,57 @@ internal object UssdAutomationStore {
       } else RecordingCommitResult.FAILED
     }
 
-    if (!current.isInteractive || !current.hasSend || current.isPasswordInput) {
-      val cleared = prefs.edit()
-        .remove(KEY_RECORDING_DRAFT).remove(KEY_RECORDING_DRAFT_SIGNATURE).remove(KEY_RECORDING_DRAFT_EVENT_TIME)
-        .commit()
+    if (!target.isInteractive || !target.hasSend || target.isPasswordInput) {
+      val editor = prefs.edit()
+      val cleared = if (resolved.isPrevious) {
+        clearPreviousClickCandidate(editor).commit()
+      } else {
+        editor.remove(KEY_RECORDING_DRAFT).remove(KEY_RECORDING_DRAFT_SIGNATURE)
+          .remove(KEY_RECORDING_DRAFT_EVENT_TIME).commit()
+      }
       return@synchronized if (cleared) RecordingCommitResult.STALE else RecordingCommitResult.FAILED
     }
-    val commitToken = "${current.recordingId}|${current.epoch}|send"
-    if (current.awaitingNextMenu || prefs.getString(KEY_RECORDING_LAST_COMMIT_TOKEN, "") == commitToken) {
-      val cleared = prefs.edit()
-        .remove(KEY_RECORDING_DRAFT).remove(KEY_RECORDING_DRAFT_SIGNATURE).remove(KEY_RECORDING_DRAFT_EVENT_TIME)
-        .commit()
+    val commitToken = "${target.recordingId}|${target.epoch}|send"
+    if (target.awaitingNextMenu || prefs.getString(KEY_RECORDING_LAST_COMMIT_TOKEN, "") == commitToken) {
+      val editor = prefs.edit()
+      val cleared = if (resolved.isPrevious) {
+        clearPreviousClickCandidate(editor).commit()
+      } else {
+        clearPreviousClickCandidate(editor
+          .remove(KEY_RECORDING_DRAFT)
+          .remove(KEY_RECORDING_DRAFT_SIGNATURE)
+          .remove(KEY_RECORDING_DRAFT_EVENT_TIME)).commit()
+      }
       return@synchronized if (cleared) RecordingCommitResult.DUPLICATE else RecordingCommitResult.FAILED
     }
-    if (current.draft.isEmpty() || current.draftEventTime <= 0L || eventTime < current.draftEventTime) {
+    if (target.draft.isEmpty() || target.draftEventTime <= 0L || eventTime < target.draftEventTime) {
       return@synchronized RecordingCommitResult.STALE
     }
     val replies = safeJsonArray(prefs.getString(KEY_RECORDING_REPLIES, "[]"))
-    replies.put(current.draft)
-    val saved = prefs.edit()
+    replies.put(target.draft)
+    val editor = prefs.edit()
       .putString(KEY_RECORDING_REPLIES, replies.toString())
       .putLong(KEY_RECORDING_UPDATED, System.currentTimeMillis())
       .putString(KEY_RECORDING_LAST_COMMIT_TOKEN, commitToken)
-      .putBoolean(KEY_RECORDING_AWAITING_NEXT_MENU, true)
-      .putString(KEY_RECORDING_COMMITTED_FINGERPRINT, current.fingerprint)
-      .putInt(KEY_RECORDING_COMMITTED_WINDOW_ID, current.windowId)
-      .putBoolean(KEY_RECORDING_POST_COMMIT_GAP, false)
-      .putLong(KEY_RECORDING_LAST_COMMIT_EVENT_TIME, eventTime)
-      .remove(KEY_RECORDING_DRAFT)
-      .remove(KEY_RECORDING_DRAFT_SIGNATURE)
-      .remove(KEY_RECORDING_DRAFT_EVENT_TIME)
-      .commit()
+    val saved = if (resolved.isPrevious) {
+      // The current state was observed after this click's event time. It already
+      // represents the next epoch, so preserve its draft and consume only the old
+      // bounded candidate in the same transaction as the reply append.
+      if (current.epoch <= target.epoch || current.observedEventTime < resolved.supersededEventTime) {
+        return@synchronized RecordingCommitResult.STALE
+      }
+      clearPreviousClickCandidate(editor).commit()
+    } else {
+      clearPreviousClickCandidate(editor
+        .putBoolean(KEY_RECORDING_AWAITING_NEXT_MENU, true)
+        .putString(KEY_RECORDING_COMMITTED_FINGERPRINT, target.fingerprint)
+        .putInt(KEY_RECORDING_COMMITTED_WINDOW_ID, target.windowId)
+        .putBoolean(KEY_RECORDING_POST_COMMIT_GAP, false)
+        .putLong(KEY_RECORDING_LAST_COMMIT_EVENT_TIME, eventTime)
+        .remove(KEY_RECORDING_DRAFT)
+        .remove(KEY_RECORDING_DRAFT_SIGNATURE)
+        .remove(KEY_RECORDING_DRAFT_EVENT_TIME)).commit()
+    }
     if (saved) RecordingCommitResult.RECORDED else RecordingCommitResult.FAILED
   }
 
